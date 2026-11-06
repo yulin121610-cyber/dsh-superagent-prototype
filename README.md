@@ -31,6 +31,10 @@ See the Jira section in [006 Deployment](docs/006-deployment.md) for the full co
 
 ## Setup
 
+### Optional Agent Teams (local.13)
+
+With the desktop runtime's matching `@deepseek-ai/dsh-experimental-agent-team-profile` bundle enabled after `dsh-base`, Ticket Executors can use `spawn_teammate`, peer messages, and the shared task board. The bundle includes the Team service, tools, and browser UI; do not mix its package versions with another runtime release. Ordinary delegation remains available when Team is disabled. When Team is enabled, Executors use rostered teammates instead of ordinary subagents, since Team message targets refer only to its roster. Team tools are scoped registrations and bypass inherited-tool masks, so the router explicitly denies them. Executors and their teammates retain the existing Ticket-end guards and read-only sandbox. Teams share the Ticket's working directory; the Lead must coordinate disjoint write scopes and wait for required results before reporting readiness.
+
 Setup has many steps, so an agent does it with you. Ask your coding agent:
 
 > Read SETUP.md in this repository and set up dsh-superagent with me.
