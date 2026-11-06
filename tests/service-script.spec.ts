@@ -2,14 +2,10 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync }
   from 'node:fs'
-import { createServer, type Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 
 let root: string
-let server: Server | undefined
 let sleepers: ChildProcess[] = []
 const control = (profile: string) => join(root, '.artifacts', 'control', 'profiles', profile)
 const program = (name: string, body: string) => writeFileSync(join(root, 'bin', name), `#!/bin/sh\n${body}\n`, { mode: 0o755 })
@@ -25,7 +21,8 @@ const service = (pid: number, profile = 'superagent') => `${pid} node node /opt/
 const processes = (...lines: string[]) => writeFileSync(join(root, 'ps.txt'), lines.map(line => `${line}\n`).join(''))
 const started = (...lines: string[]) => writeFileSync(join(root, 'ps-started.txt'), lines.map(line => `${line}\n`).join(''))
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'service script '))
+  mkdirSync('.artifacts', { recursive: true })
+  root = mkdtempSync(join(process.cwd(), '.artifacts', 'service script '))
   mkdirSync(join(root, 'scripts')); mkdirSync(join(root, 'bin'))
   copyFileSync(join(import.meta.dirname, '..', 'scripts', 'dsh-superagent'), join(root, 'scripts', 'dsh-superagent'))
   processes()
@@ -42,26 +39,43 @@ done < "$list"`)
   program('dsh', 'exit 0')
 })
 afterEach(() => {
-  server?.close(); server = undefined
   for (const child of sleepers) child.kill()
   sleepers = []
   rmSync(root, { recursive: true, force: true })
 })
 function run(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise(resolve => execFile('python3', [join(root, 'scripts', 'dsh-superagent'), ...args],
+  return new Promise(resolve => execFile('python3', ['-c', MOCK_HTTP, join(root, 'scripts', 'dsh-superagent'), ...args],
     { env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
       timeout: 20_000 },
     (error, stdout, stderr) => resolve({ code: typeof error?.code === 'number' ? error.code : 0, stdout, stderr })))
 }
 const READY = { health: { runtime: { state: 'ready', detail: '' } }, setup: { problem: null, feishuProblem: null } }
-/** Start a mock HTTP server that returns 503 until tmux launches the service (unless always is true). */
+/** Python transport seam for the real service script: JSON decoding and lifecycle behavior still execute unchanged. */
+const MOCK_HTTP = `import io, json, pathlib, runpy, sys, urllib.request
+script = pathlib.Path(sys.argv[1])
+root = script.parent.parent
+def urlopen(request, timeout):
+    assert request.get_method() == 'GET'
+    assert request.get_header('X-orchestrator-request') == '1'
+    assert timeout == 2
+    fixture = root / 'http-response.json'
+    if not fixture.exists():
+        raise OSError('mock connection refused')
+    response = json.loads(fixture.read_text())
+    assert request.full_url.endswith('/orchestrator/api/state')
+    if request.full_url != response['url'] + '/orchestrator/api/state':
+        raise OSError('mock connection refused')
+    if not response['always'] and not (root / 'launched').exists():
+        raise OSError('mock HTTP 503')
+    return io.StringIO(json.dumps(response['state']))
+urllib.request.urlopen = urlopen
+sys.argv = sys.argv[1:]
+runpy.run_path(str(script), run_name='__main__')`
+/** Register a mock HTTP response, unavailable until tmux launches the service (unless always is true), without sockets. */
 async function answering(state: unknown = READY, always = false): Promise<string> {
-  server = createServer((_request, response) => {
-    if (!always && !existsSync(join(root, 'launched'))) { response.writeHead(503).end(); return }
-    response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(state))
-  })
-  await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve))
-  return `http://127.0.0.1:${(server!.address() as AddressInfo).port}`
+  const url = 'http://127.0.0.1:3082'
+  writeFileSync(join(root, 'http-response.json'), JSON.stringify({ url, state, always }))
+  return url
 }
 const status = async (profile: string, url = 'http://127.0.0.1:9') =>
   JSON.parse((await run('status', '--profile', profile, '--url', url)).stdout) as { pids: number[]; manually_stopped: boolean }
@@ -137,9 +151,7 @@ it('reports a service whose Feishu bot setup could not check as running, and rea
   const feishu = { health: { runtime: { state: 'ready', detail: '' }, feishu: { state: 'paused', detail: '' } },
     setup: { problem: null, feishuProblem: { code: 'feishuNoBot', detail: 'No bot' } } }
   expect(await run('status', '--url', await answering(feishu, true))).toMatchObject({ code: 0 })
-  server!.close()
   expect(await run('status', '--url', await answering({ health: { runtime: { state: 'ready' } } }, true))).toMatchObject({ code: 0 })
-  server!.close()
   expect(await run('status', '--url', await answering({ health: { runtime: { state: 'error' } } }, true))).toMatchObject({ code: 1 })
 })
 it('exits 2 while a part such as a Source reports an error, which a restart does not fix, and prints what it reports', async () => {

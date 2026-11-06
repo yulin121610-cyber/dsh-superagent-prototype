@@ -5,6 +5,7 @@ import { DisclosureRow, Dot, Icon, Tag, type IconName } from './controls.tsx'
 import { decisionMark, reportDot, ticketMark } from './marks.ts'
 import { usePanel } from './provider.tsx'
 import { settingsRoute } from './route.ts'
+import { JiraTicketSync } from './jira.tsx'
 import { Earlier, ThreadLine, automatedRuns } from './rows.tsx'
 import { actorName, localized, readableMarkers, reasonLabel, valueLabel, when } from './text.ts'
 import { ActionLink, ConfirmButton, ExternalLink, Hint, KeyValues, LabelValue, LoadState, MarkdownLite, PageHead, Section, SessionButton,
@@ -154,6 +155,7 @@ export function TicketPage({ id }: { id: string }) {
       <span className="dt-banner-label">{t('deliveryFailedPrefix')}</span>{data.deliveryError}
     </p>}
     <MandateDetails ticket={data} actor={actor} />
+    <JiraTicketSync id={id} jira={data.jira} available={!!data.jiraSync} reload={reload} />
     {undelivered.length > 0 && <Section title={t('undeliveredInputs')} count={undelivered.length}>
       <Hint>{data.deliveryError ? t('inputRetryHint') : data.paused ? t('inputPausedHint') : t('inputWaitingHint')}</Hint>
       <InputList inputs={undelivered} />

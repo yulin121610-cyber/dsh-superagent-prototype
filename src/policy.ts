@@ -9,6 +9,7 @@ import { key, type AssessmentOutcome, type Mandate, type Policy, type PolicyEffe
   type Trigger, type ActorRef, type GateResult } from './core/index.ts'
 import { sameName } from './infra/text.ts'
 import { WORKER_COMMANDS } from './infra/environment.ts'
+import { JiraConfigSchema } from './jira/config.ts'
 
 export const RuleIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/)
 export const RuleMatchSchema = z.object({ rule_id: RuleIdSchema, reason: z.string().trim().min(1).max(500) }).strict()
@@ -107,9 +108,10 @@ export const SettingsSchema = z.object({
   policy: PolicyConfigSchema.default(() => PolicyConfigSchema.parse({})),
   eval: EvalConfigSchema.default(() => EvalConfigSchema.parse({})),
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
+  jira: JiraConfigSchema.default(() => JiraConfigSchema.parse({})),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
-export type SettingsBlock = 'policy' | 'eval' | 'executor' | `source:${string}`
+export type SettingsBlock = 'policy' | 'eval' | 'executor' | 'jira' | `source:${string}`
 export type SettingsSave = SettingsBlock | 'pause'
 export type SettingsOrigin = 'panel' | 'tool' | 'sync'
 

@@ -384,3 +384,8 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
 .dt-admission-slot { display: inline-flex; flex: none; width: 16px; }
 .dt-info-warn { color: var(--dsw-alias-state-warn-primary); }
 .dt-field-segmented { max-width: 240px; }
+
+/* Jira shares the panel controls and table tokens. */
+.dt-jira-table { overflow-x: auto; }
+.dt-jira-table .dt-table { min-width: 660px; }
+.dt-jira-board { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }

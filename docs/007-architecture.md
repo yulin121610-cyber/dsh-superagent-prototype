@@ -176,6 +176,7 @@ Failures retry with exponential backoff. Throwing `Later` defers work without co
 | `delivery` | DshExecutor | Hands a Ticket's waiting Inputs to its running Assignment, in order | 4, none while paused | 2 s doubling to 60 s; one that waits for a worker slot tries again after 2 s |
 | `relay` | Sessions | Steers a worker's report or question, or a person's follow-up, into the main Session's turn | 1, in queue order | 2 s doubling to 60 s |
 | `notice` | Sessions | Injects a notice into the main Session without waking it | 1, in queue order | 2 s doubling to 60 s |
+| `jira` | Jira | Reconciles an enrolled ticket’s ordered journal: create once or recover its stable marker, transition, comment with operation marker | 2, none while disabled or paused | 5 s doubling to 300 s; Later for held work |
 | `reply` | Outbox | Sends a message for a Channel through its Source, after the earlier messages of its Ticket to its conversation that have not failed three times; withdrawing the message cancels it | 1, none while paused | 5 s doubling to 300 s; one whose Source is off, or behind an earlier message, tries again after 5 s |
 
 Each kind has a health entry under its name. It reports an error once one of its effects failed three times in a row, except `delivery`, whose failures show on their Ticket instead. Relays keep their order, and so do notices; a failed one holds back the later ones of its kind.
@@ -267,6 +268,7 @@ Each model request binds the Session to the current prompt revision. The revisio
   | Settings and their history | Settings |
   | Prompt versions | Prompts |
   | Effect rows | Effects |
+  | Ticket `jira` metadata and Jira journals | Jira adapter, via `Store.setTicketJira`; every domain/executor ticket save preserves the latest adapter metadata |
   | Outbox receipts | The Outbox: the Engine's messages and Sources' `notify` go through its `send`, and its `reply` effects mark them |
   | A health entry | The part that claimed it on the `HealthBoard` (`src/infra/health.ts`), which refuses a second claim: `runtime` the Runtime, which Passes report through, `evals` the Runtime after each pass, `models` Sessions, each effect kind Effects, `worker` the DshExecutor, a Source kind's entries the SourceRegistry for that kind's Source, `sync:<id>` Settings |
 
@@ -324,6 +326,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
 | `src/app/effects.ts` | Effects |
+| `src/app/jira.ts` | Jira adapter: explicit enrollment, durable create intent and ordered state/comment journals, transition reconciliation, scoped cached issue search, connection probes. |
+| `src/jira/config.ts` | Strict Jira settings schema, group mappings, states and credential references. |
+| `src/jira/client.ts` | Backend-only credential loading and bounded REST v2 transport; redirection refusal and sanitized errors. |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |
@@ -386,6 +391,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/overview.tsx` | The overview |
 | `src/client/source.tsx`, `trigger.tsx`, `eval.tsx`, `execution.tsx` | One file per stage: its status, and its settings where it has some |
 | `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
+| `src/client/jira.tsx` | Jira settings, paged issue list/status board, and explicit per-ticket enrollment/recovery actions. |
 | `src/client/settings.tsx` | The Settings tab: the group navigation and the group on screen |
 | `src/client/settings-kit.tsx` | The building blocks of settings blocks: the settings the stage groups share, `useBlockDraft`, the fields, among them a Source kind's, and the history of saves |
 | `src/client/prompts.tsx` | The Prompts settings: the page owns the view it read and its editor the draft, and the Edit, Full prompt and History tabs render from them; a built-in part's editor shows a changed default and keeps or drops the override |
@@ -418,6 +424,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
+| `tests/jira.spec.ts`, `tests/panel-jira.spec.tsx` | In-memory Jira HTTP simulation without sockets: secret boundaries, retry/restart recovery, ordered transitions/comments, outages and real Runtime isolation, search/pagination/cache, and zh/en panel/settings/actions. |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
 | `tests/outbox.spec.ts` | The Outbox on a running Runtime: messages wait while processing is paused or their Source is not installed |
@@ -441,7 +448,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
 | `tests/local-workspace.spec.ts` | Local workspace startup without GitHub, GitLab remote preservation, disabled GitHub operations, service locks and strict worker serialization |
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
-| `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
+| `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh`, with the Python HTTP transport mocked without sockets |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
@@ -466,7 +473,7 @@ One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens.
 | `decision` | Decisions, by Thread | Engine |
 | `effect` | The effect queue: per kind and key, the payload, its order, failed attempts with the last error, and when it is due | Effects; the schema 11 migration queues what earlier versions kept for the main Session |
 | `outbox` | The receipt of each message for a Channel, by id, with the Ticket it is for and its `status`, `pending`, `sent` or `dropped`, kept so an id is never queued twice; for a dropped message, when and why, as the generated column `dropped`, its time, and a reason code. A message that waits has a `reply` effect, which holds its attempts | The Outbox |
-| `kv` | Every other record, by key | The part that names it |
+| `kv` | Every other record, by key, including `jira-ticket:<id>` enrollment and operation journals | The part that names it |
 
 A generated column is computed from its row's JSON and is empty outside its set, and each has an index over its set, so a pass reads only active work. A database that predates a column gets it when the Store opens it.
 
@@ -620,3 +627,11 @@ Point `DSH_HOME` at a temporary directory and create a new profile there. Copy t
 
 - Trust: which Trigger fields are trusted, such as the Source's actor and Thread membership, and which are not, such as the body and quotes.
 - Deployment isolation: the agent's profile on its own pinned DeepSeek Harness installation, so upgrading DeepSeek Harness elsewhere does not break it.
+
+## Jira adapter boundary (local.12)
+
+`Runtime` constructs `Jira` after Effects and source-link resolution, before Engine. `Store.ticketSaved` invokes the adapter in the ticket-save transaction. It enrolls only a newly accepted, configured Feishu-group ticket or an explicit per-ticket sync action; it never scans historical tickets. Subsequent saves append operations only when the core-derived ticket state changes. No HTTP runs in this hook. `Store.setTicketJira` updates only adapter-owned key/URL/error/pending metadata, and domain/executor saves retain its latest value even when they began before an asynchronous sync finished.
+
+`KV.jira.ticket(id)` keeps the frozen base URL/project mapping, description, deterministic marker, last observed state, sequence and ordered pending operations. The one effect per ticket drains its journal while preserving operations appended during an await. Settings contain a credential reference only; the REST client resolves it for each operation and never returns it or remote error bodies. The client refuses redirects and caps response size and request time. A bounded 15-second cache holds only search results. Raw JQL is enclosed by a validated project scope and rejects unbalanced parentheses/quotes that could escape that scope.
+
+A create send intent commits before the HTTP write. Unknown outcomes reconcile by marker and never automatically re-create: this deliberately prefers no duplicate over blind progress where Jira REST v2 cannot provide an atomic idempotency key. Comments have durable send intents and page through marker history; transitions remember the target status before posting and read status on retry. Journal/error updates are independent of ticket execution. Disabled defaults add no Jira ticket fields, enrollment or outbound calls, and GitHub workflow behavior remains unchanged. The explicit confirmation needed to retry an uncertain write, setup and configuration examples are documented in [006 Deployment](006-deployment.md).

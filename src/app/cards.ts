@@ -36,6 +36,7 @@ export function ticketCard(ticket: Ticket) {
   const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
+    ...ticket.jira ? { jira: ticket.jira } : {},
     ...ticket.execution?.access === 'read-only' ? { access: 'read-only' as const } : {},
     ...ticket.execution?.services?.length ? { services: ticket.execution.services.map(service => service.name) } : {},
     ...worktreeCard(ticket),

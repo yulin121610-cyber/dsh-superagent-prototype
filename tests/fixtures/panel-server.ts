@@ -14,6 +14,7 @@ import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, Source
   TriggerRow } from '../../src/client/api.ts'
 import { SETUP_FIELDS } from '../../src/deployment.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema } from '../../src/policy.ts'
+import { JiraConfigSchema } from '../../src/jira/config.ts'
 import { SetupError, type SetupCode } from '../../src/setup.ts'
 import { feishuChannel } from '../../src/sources/feishu-trigger.ts'
 import { githubChannel } from '../../src/sources/github-trigger.ts'
@@ -93,6 +94,7 @@ export interface PanelServer {
   threads: ThreadRow[]
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
   person: TicketRow[]; search: Pick<ApiResponse<'GET search'>, 'items' | 'threads'>; history: HistoryView
+  jiraSearch?: (query: Record<string, string | undefined>) => ApiResponse<'GET jira/search'>
   requests: { path: string; method: string; body?: unknown }[]
   /** Candidates returned by service discovery for the Feishu settings row. */
   discovered?: { name: string; path: string; kind: 'repo' | 'directory' }[]
@@ -167,7 +169,7 @@ const stateView = (): StateView => ({
 })
 const settingsView = (): ApiResponse<'GET settings'> => ({
   policyVersion: 'abcdef1234567890',
-  blocks: { policy: { value: server.settings.policy, revision: server.revisions.policy ?? 0 },
+  blocks: { jira: { value: server.settings.jira, revision: server.revisions.jira ?? 0 }, policy: { value: server.settings.policy, revision: server.revisions.policy ?? 0 },
     eval: { value: server.settings.eval, revision: server.revisions.eval ?? 0 },
     executor: { value: server.settings.executor, revision: server.revisions.executor ?? 0 } },
   sources: sourceSettings(),
@@ -293,6 +295,12 @@ const ticketOf = (id: string) =>
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
+  'GET jira': { answer: () => ({ enabled: server.settings.jira.enabled, projects: [...new Set(server.settings.jira.mappings.map(row => row.projectKey))], warning: '' }) },
+  'GET jira/search': { query: ['project', 'filter', 'text', 'jql', 'startAt', 'maxResults', 'refresh'], answer: ({ query }) => server.jiraSearch?.(query)
+    ?? { issues: [], startAt: Number(query.startAt ?? 0), total: 0, next: null } },
+  'POST jira/test': { body: true, answer: () => ({ user: 'Jira Bot', issueTypes: [{ id: '3', name: 'Task' }], sampleIssue: 'DEMO-1',
+    transitions: [{ id: '21', name: 'Start', to: 'In Progress' }], warning: '' }) },
+  'POST tickets/:id/jira': { body: true, answer: () => ({ queued: true }) },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {
@@ -330,7 +338,11 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     'Unavailable Eval not found') },
   'GET tickets': { query: ['state', 'offset', 'limit'], answer: ({ query }) => page(server.tickets[query.state === 'ended' ? 'ended'
     : 'open']) },
-  'GET tickets/:id': { answer: ({ params }) => server.ticketDetails[params.id] ?? refuse(404, 'Ticket not found') },
+  'GET tickets/:id': { answer: ({ params }) => {
+    const ticket = server.ticketDetails[params.id]
+    return ticket ? { ...ticket, ...server.settings.jira.enabled && ticket.mandate.actor.source === 'feishu' ? { jiraSync: true } : {} }
+      : refuse(404, 'Ticket not found')
+  } },
   'POST tickets/:id/retry': { answer: ({ params }) => {
     const ticket = ticketOf(params.id)
     if (!ticket) return refuse(404, 'Ticket not found')
@@ -349,12 +361,13 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   } },
   'PUT settings/:block': { body: true, answer: ({ params: { block }, body }) => {
     const source = block.startsWith('source:') ? KINDS.find(kind => `source:${kind.kind}` === block) : undefined
-    if (!['policy', 'eval', 'executor'].includes(block) && !source) return block.startsWith('source:') ? refuse(404, 'Source not found')
+    if (!['policy', 'eval', 'executor', 'jira'].includes(block) && !source) return block.startsWith('source:') ? refuse(404, 'Source not found')
       : refuse(400, 'Invalid settings: block')
     if (body.revision !== (server.revisions[block] ?? 0)) return refuse(409, 'Settings changed. Reload before saving.')
     let restarting = false
     if (block === 'policy') server.settings = { ...server.settings, policy: PolicyConfigSchema.parse(body.value) }
     else if (block === 'executor') server.settings = { ...server.settings, executor: ExecutorConfigSchema.parse(body.value) }
+    else if (block === 'jira') server.settings = { ...server.settings, jira: JiraConfigSchema.parse(body.value) }
     else if (block === 'eval') server.settings = { ...server.settings, eval: EvalConfigSchema.parse(body.value) }
     else if (source) {
       const { enabled, config: value } = SourceSave.parse(body.value)

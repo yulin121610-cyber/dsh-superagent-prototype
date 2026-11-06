@@ -5,7 +5,7 @@ import { Icon, Tag } from './controls.tsx'
 import { decisionMark, threadMark, ticketMark } from './marks.ts'
 import { usePanel } from './provider.tsx'
 import { actorName, localized, readableMarkers, reasonLabel, valueLabel } from './text.ts'
-import { ActionLink, ConfirmButton, LabelValue, SessionButton, StageMark, When } from './widgets.tsx'
+import { ActionLink, ConfirmButton, ExternalLink, LabelValue, SessionButton, StageMark, When } from './widgets.tsx'
 
 export function TicketLine({ ticket, question, onChanged, context }: {
   ticket: TicketRow; question?: boolean; onChanged?: () => Promise<void>; context?: boolean
@@ -21,6 +21,8 @@ export function TicketLine({ ticket, question, onChanged, context }: {
       <div className="dt-row-title"><button type="button" className="dt-open" onClick={() => navigate({ page: 'execution',
         id: ticket.id })}>{ticket.title}</button></div>
       <div className="dt-row-meta dt-ticket-meta">
+        {ticket.jira?.key && ticket.jira.url && <ExternalLink href={ticket.jira.url}>{ticket.jira.key}</ExternalLink>}
+        {ticket.jira?.error && <span className="dt-error-text" title={ticket.jira.error}>{t('jira.syncError')}</span>}
         {ticket.threads.map(thread => <ThreadChip key={thread.key} thread={thread} />)}
         {context && <ContextTag />}
         {ticket.undelivered > 0 && <LabelValue label={t('ticketUndeliveredLabel')} value={ticket.undelivered} />}
