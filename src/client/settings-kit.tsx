@@ -160,16 +160,18 @@ export function ConfigHistory({ blocks, versions, focus }: { blocks: string[]; v
   </DisclosureRow>
 }
 
-type Row = Record<string, string>
+type Row = Record<string, unknown>
 type Column = Extract<FieldSpec, { type: 'rows' }>['columns'][number]
 const ROWS_SHOWN = 6
 const byName = ([, a]: [string, string], [, b]: [string, string]) => a.localeCompare(b)
-function RowsField({ field, value, saved, onChange, labels, refreshLabels }: {
+const cellText = (row: Row, key: string): string => typeof row[key] === 'string' ? row[key] : ''
+function RowsField({ field, value, saved, onChange, labels, refreshLabels, sourceId }: {
   field: Extract<FieldSpec, { type: 'rows' }>; value: unknown; saved: unknown; onChange: (next: unknown) => void; labels: Record<string,
     string>
   refreshLabels: (() => Promise<string[]>) | undefined
+  sourceId?: string
 }) {
-  const { t, notify } = usePanel()
+  const { t, notify, call } = usePanel()
   const [open, setOpen] = useState(false)
   const refresh = useAction(async () => {
     try {
@@ -181,17 +183,36 @@ function RowsField({ field, value, saved, onChange, labels, refreshLabels }: {
   const rows = Array.isArray(value) ? value as Row[] : []
   const set = (index: number, row: Row) => onChange(rows.map((item, position) => position === index ? row : item))
   const key = field.columns[0]!
-  const savedKeys = new Set((Array.isArray(saved) ? saved as Row[] : []).map(row => row[key.key]))
+  const savedKeys = new Set((Array.isArray(saved) ? saved as Row[] : []).map(row => cellText(row, key.key)))
+  const nested = field.nested
+  const servicesOf = (row: Row): Record<string, string>[] => {
+    const value = nested ? row[nested.key] : undefined
+    if (!Array.isArray(value)) return []
+    return value.map(item => {
+      const record = item as Record<string, unknown>
+      return Object.fromEntries((nested?.columns ?? []).map(column => [column.key, typeof record[column.key] === 'string' ? record[column.key] : ''])) as Record<string, string>
+    })
+  }
+  const discover = useAction(async (index: number) => {
+    const project = cellText(rows[index] ?? {}, 'projectPath')
+    if (!project || !sourceId || !nested) return
+    const found = await call('POST sources/:id/services', { id: sourceId, body: { projectPath: project } })
+    const current = servicesOf(rows[index] ?? {})
+    const known = new Set(current.map(item => item.path))
+    const added = found.services.filter(service => !known.has(service.path)).map(service => ({ name: service.name, path: service.path }))
+    set(index, { ...rows[index], [nested.key]: [...current, ...added] })
+    notify(added.length ? t('servicesDiscovered', { count: added.length }) : t('servicesNone'))
+  })
   const choose = key.type === 'text' && key.choose && Object.keys(labels).length ? localized(t, key.choose) : ''
   // Exclude options already selected in another row.
   const choices = (id: string) => Object.entries(labels).filter(([option]) => option === id
-    || !rows.some(other => other[key.key] === option)).sort(byName)
+    || !rows.some(other => cellText(other, key.key) === option)).sort(byName)
   const blank = Object.fromEntries(field.columns.map(column => [column.key, column.type === 'select' ? column.options[0]!.value : '']))
   // Summarize a row by its second column only when that column is free text (e.g., a display name), not a select option.
   const named = field.columns[1]?.type === 'text' ? field.columns[1] : undefined
-  const rowName = (row: Row) => (named && row[named.key]) || labels[row[key.key] ?? ''] || row[key.key] || ''
+  const rowName = (row: Row) => (named && cellText(row, named.key)) || labels[cellText(row, key.key)] || cellText(row, key.key) || ''
   const cell = (row: Row, index: number, column: Column) => {
-    const id = row[key.key] ?? '', change = (next: string) => set(index, { ...row, [column.key]: next })
+    const id = cellText(row, key.key), change = (next: string) => set(index, { ...row, [column.key]: next })
     if (column === key && (savedKeys.has(id) || (!choose && labels[id]))) {
       return <span key={column.key} className={labels[id] ? 'dt-row-label' : 'dt-row-label dt-mono'} title={id}>{labels[id] ?? id}</span>
     }
@@ -203,15 +224,42 @@ function RowsField({ field, value, saved, onChange, labels, refreshLabels }: {
       </select>
     }
     if (column.type === 'select') {
-      return <select key={column.key} className="dt-select" aria-label={localized(t, column.label)} value={row[column.key] ?? ''}
+      return <select key={column.key} className="dt-select" aria-label={localized(t, column.label)} value={cellText(row, column.key)}
         onChange={event => change(event.target.value)}>
         {column.options.map(option => <option key={option.value} value={option.value}>{localized(t, option.label)}</option>)}
       </select>
     }
     return <Input key={column.key} className={column.optional ? undefined : 'dt-mono'} aria-label={localized(t, column.label)}
       placeholder={localized(t, column.label)}
-      required={!column.optional} pattern={column.pattern} spellCheck={false} value={row[column.key] ?? ''}
+      required={!column.optional} pattern={column.pattern} spellCheck={false} value={cellText(row, column.key)}
         onChange={event => change(event.target.value)} />
+  }
+  const services = (row: Row, index: number) => {
+    if (!nested) return null
+    const list = servicesOf(row)
+    if (!cellText(row, 'projectPath') && !list.length) return null
+    const blankService = Object.fromEntries(nested.columns.map(column => [column.key, '']))
+    const edit = (next: Record<string, string>[]) => set(index, { ...row, [nested.key]: next })
+    return <div className="dt-rows-services">
+      <div className="dt-subhead">
+        <span className="dt-field-head">{localized(t, nested.label)}{nested.hint && <InfoTip text={localized(t, nested.hint)} />}<span
+          className="dt-count">{list.length || ''}</span></span>
+        <span className="dt-subhead-actions">
+          {nested.discover && sourceId && <Button variant="ghost" size="sm" className={discover.busy ? 'dt-btn-busy' : undefined}
+            icon={<Icon name="search" />} disabled={discover.busy || !cellText(row, 'projectPath')} aria-busy={discover.busy}
+            onClick={() => { void discover.run(index) }}>{localized(t, nested.discover)}</Button>}
+          <Button variant="ghost" size="sm" icon={<Icon name="plus" />} onClick={() => edit([...list, blankService])}>{t('addRow')}</Button>
+        </span>
+      </div>
+      {list.map((service, serviceIndex) => <div key={serviceIndex} className="dt-service-row">
+        {nested.columns.map(column => <Input key={column.key} className="dt-mono" aria-label={localized(t, column.label)}
+          placeholder={localized(t, column.label)} required pattern={column.type === 'text' ? column.pattern : undefined} spellCheck={false}
+          value={service[column.key] ?? ''}
+          onChange={event => edit(list.map((item, position) => position === serviceIndex ? { ...item, [column.key]: event.target.value } : item))} />)}
+        <Button variant="ghost" size="sm" icon={<Icon name="trash" />} aria-label={t('removeRow', { name: service.name || localized(t, nested.label) })}
+          onClick={() => edit(list.filter((_, position) => position !== serviceIndex))} />
+      </div>)}
+    </div>
   }
   return <div className="dt-field">
     <div className="dt-subhead">
@@ -229,18 +277,27 @@ function RowsField({ field, value, saved, onChange, labels, refreshLabels }: {
       {open ? t('collapse') : rows.map(rowName).join(t('listSeparator'))}
     </button>}
     {(rows.length <= ROWS_SHOWN || open) && <ul className="dt-rows"
-      style={{ ['--dt-columns' as string]: field.columns.length }}>{rows.map((row, index) => <li key={index} className="dt-rows-item">
-      {field.columns.map(column => cell(row, index, column))}
-      <Button variant="ghost" size="sm" icon={<Icon name="trash" />} aria-label={t('removeRow', { name: labels[row[key.key] ?? '']
-        || row[key.key] || label })}
-        onClick={() => onChange(rows.filter((_, position) => position !== index))} />
+      style={{ ['--dt-columns' as string]: field.columns.length }}>{rows.map((row, index) => <li key={index}
+        className={nested ? 'dt-rows-item dt-rows-nested' : 'dt-rows-item'}>
+      {nested ? <div className="dt-rows-line">{field.columns.map(column => cell(row, index, column))}
+        <Button variant="ghost" size="sm" icon={<Icon name="trash" />} aria-label={t('removeRow', { name: labels[cellText(row, key.key)]
+          || cellText(row, key.key) || label })}
+          onClick={() => onChange(rows.filter((_, position) => position !== index))} />
+      </div> : <>
+        {field.columns.map(column => cell(row, index, column))}
+        <Button variant="ghost" size="sm" icon={<Icon name="trash" />} aria-label={t('removeRow', { name: labels[cellText(row, key.key)]
+          || cellText(row, key.key) || label })}
+          onClick={() => onChange(rows.filter((_, position) => position !== index))} />
+      </>}
+      {services(row, index)}
     </li>)}</ul>}
   </div>
 }
-export function SourceField({ field, value, saved, fact, onChange, labels, refreshLabels }: {
+export function SourceField({ field, value, saved, fact, onChange, labels, refreshLabels, sourceId }: {
   field: FieldSpec; value: unknown; saved: unknown; fact: Localized | string | undefined; onChange: (next: unknown) => void
   labels: Record<string, string>
   refreshLabels?: () => Promise<string[]>
+  sourceId?: string
 }) {
   const { t, navigate } = usePanel()
   const label = localized(t, field.label), hint = localized(t, field.hint)
@@ -273,6 +330,6 @@ export function SourceField({ field, value, saved, fact, onChange, labels, refre
       </small>}
     </div>
     case 'rows': return <RowsField field={field} value={value} saved={saved} onChange={onChange} labels={labels}
-      refreshLabels={refreshLabels} />
+      refreshLabels={refreshLabels} {...sourceId ? { sourceId } : {}} />
   }
 }

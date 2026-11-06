@@ -1,4 +1,5 @@
 /** Domain model of a proactive agent: the concepts and their invariants, independent of any source, policy, or executor. */
+import { sep } from 'node:path'
 import type { Reason } from './reasons.ts'
 
 /** Actor identity in the source's own vocabulary; Policy decides which actors may originate work on that Source. */
@@ -312,6 +313,19 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
+/** One service a ticket touches, frozen at accept from the group's list. `path` is the canonical directory inside the project. */
+export interface ServiceScope {
+  name: string
+  path: string
+  /**
+   * Git toplevel that contains `path`, when the service is inside a repository. Equal to `path` when the service is its own
+   * repository. A parent of `path` when the service is a subdirectory of one checkout: writers that share it contend on that
+   * checkout's index and branch unless each runs in its own worktree.
+   */
+  repository?: string
+}
+/** A host-managed git worktree. `service` names the multi-repo service whose checkout this worktree is. */
+export interface WorktreeRecord { path: string; branch: string; repository: string; service?: string; base?: string; error?: string; removedAt?: string }
 export interface Execution {
   name: string; directory: string; assignment: string
   /** Canonical project root bound by the originating group at acceptance; later settings changes do not move this ticket. */
@@ -319,15 +333,83 @@ export interface Execution {
   /** Frozen execution access; missing on legacy tickets means exclusive write access. */
   access?: 'read-only' | 'write'
   /**
+   * Services this ticket touches, frozen at accept. Absent when the group lists none, or the route chose the whole project:
+   * the lock is then `projectPath`, which conflicts with every service ticket there. Paths stay as accepted; later edits to
+   * the group's list do not move this ticket.
+   */
+  services?: ServiceScope[]
+  /**
    * Local write tickets on a git project: the host-managed worktree the ticket runs in, outside the project, on its own branch,
    * with `directory` inside it. It runs without the project lock. `error` records why it could not be created, and then
    * `directory` is the project and the ticket holds the project lock as before. `removedAt` is set once a clean worktree with no
-   * unmerged commit was removed after the ticket ended; resuming the ticket creates it again.
+   * unmerged commit was removed after the ticket ended; resuming the ticket creates it again. A monorepo ticket has one of
+   * these for the repository, shared by every service it touches.
    */
-  worktree?: { path: string; branch: string; repository: string; base?: string; error?: string; removedAt?: string }
+  worktree?: WorktreeRecord
+  /** One worktree per touched service repository, when a multi-repo ticket isolates several checkouts. */
+  worktrees?: WorktreeRecord[]
+  /**
+   * Directory that exposes every touched service together: each service's worktree or a link to its shared checkout, plus
+   * links to the project's shared non-git files. `directory` is this path.
+   */
+  aggregate?: { path: string }
 }
-/** Whether a ticket runs isolated in its own host-managed worktree, and so holds no project lock. */
-export const isolatedExecution = (execution: Execution | undefined): boolean => !!execution?.worktree && !execution.worktree.error
+/** Every worktree recorded on an execution, the single one and the per-service ones, without duplicating a path. */
+export function worktreesOf(execution: Execution | undefined): WorktreeRecord[] {
+  if (!execution) return []
+  const listed = execution.worktrees ?? []
+  const single = execution.worktree && !listed.some(tree => tree.path === execution.worktree!.path) ? [execution.worktree] : []
+  return [...single, ...listed]
+}
+/** Whether a worktree without `error` covers `service`: it is that service's checkout, or the repository the service lives in. */
+export function serviceCovered(execution: Execution | undefined, service: ServiceScope): boolean {
+  return worktreesOf(execution).some(tree => !tree.error && (tree.service === service.name
+    || (!tree.service && !!service.repository && tree.repository === service.repository)))
+}
+/**
+ * Whether a ticket runs entirely outside the shared checkout, and so holds no project lock. A service ticket is isolated
+ * only when every service it touches is covered by a worktree that was created; one that fell back is not.
+ */
+export function isolatedExecution(execution: Execution | undefined): boolean {
+  const trees = worktreesOf(execution)
+  if (!trees.length || trees.some(tree => tree.error)) return false
+  if (!execution?.services?.length) return true
+  return execution.services.every(service => serviceCovered(execution, service))
+}
+/** What a local ticket contributes to project locks. GitHub mode does not ask. */
+export interface LockClaim {
+  readOnly: boolean
+  isolated: boolean
+  /** Undefined conflicts with every claim that is not isolated and not a fellow reader: an unbound or legacy workspace. */
+  scopes?: string[]
+  /** Checkouts this ticket writes in place. Two such writers of one checkout conflict even when their service paths do not. */
+  writeRepos?: string[]
+}
+/** The lock claim frozen on `execution`. No services means the whole project, as before services existed. */
+export function lockClaim(execution: Execution | undefined): LockClaim {
+  const readOnly = execution?.access === 'read-only'
+  const isolated = isolatedExecution(execution)
+  const services = execution?.services
+  if (!services?.length) return { readOnly, isolated, ...execution?.projectPath ? { scopes: [execution.projectPath] } : {} }
+  if (isolated) return { readOnly: false, isolated: true, scopes: services.map(service => service.path) }
+  const exclusive = services.filter(service => !serviceCovered(execution, service))
+  const held = (readOnly ? services : exclusive.length ? exclusive : services).map(service => service.path)
+  const writeRepos = readOnly ? [] : [...new Set(exclusive.flatMap(service => service.repository && service.repository !== service.path ? [service.repository] : []))]
+  return { readOnly, isolated: false, scopes: held, ...writeRepos.length ? { writeRepos } : {} }
+}
+/** Whether two local claims cannot run together. Isolated worktrees touch no shared checkout, so they never conflict. */
+export function claimsConflict(left: LockClaim, right: LockClaim): boolean {
+  if (left.isolated || right.isolated) return false
+  if (left.readOnly && right.readOnly) return false
+  if (!left.scopes || !right.scopes) return true
+  const overlaps = (parent: string, child: string) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep)
+  if (left.scopes.some(scope => right.scopes!.some(other => overlaps(scope, other) || overlaps(other, scope)))) return true
+  if (!left.readOnly && !right.readOnly) {
+    const repos = new Set(left.writeRepos ?? [])
+    if ((right.writeRepos ?? []).some(repo => repos.has(repo))) return true
+  }
+  return false
+}
 
 /** Whether a ticket is open: it has not ended. */
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended

@@ -148,3 +148,24 @@ it('lists the settings groups stages first, opens each stage\'s group from its s
   await click(tab(zh['tab.settings']))
   expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['promptPart.runtime/work'])
 })
+
+it('discovers services for a group project, lets them be edited, and saves the list', async () => {
+  server.discovered = [{ name: 'ebfs-pay', path: 'ebfs-pay', kind: 'repo' }, { name: 'ebfs-account', path: 'ebfs-account', kind: 'repo' }]
+  await mount()
+  await click(zh['tab.source'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  await type(field<HTMLInputElement>('项目目录'), '/Users/me/work/shop')
+  await click('发现服务')
+  expect(server.requests.some(request => request.path === 'sources/feishu/services' && request.method === 'POST')).toBe(true)
+  expect(all('input[aria-label="服务名"]').map(input => (input as HTMLInputElement).value)).toEqual(['ebfs-pay', 'ebfs-account'])
+  await type(all('input[aria-label="服务名"]')[0] as HTMLInputElement, 'pay')
+  const add = [...document.querySelector('.dt-rows-services')!.querySelectorAll('button')].find(button => button.textContent === zh.addRow)!
+  await click(add)
+  const names = all('input[aria-label="服务名"]') as HTMLInputElement[]
+  const paths = all('input[aria-label="相对路径"]') as HTMLInputElement[]
+  await type(names[2]!, 'gateway')
+  await type(paths[2]!, 'ebfs-gateway')
+  await click(zh.save)
+  expect(server.settings.sources.feishu!.config.chats).toEqual([{ chatId: 'oc_team', listen: 'mentions', projectPath: '/Users/me/work/shop',
+    services: [{ name: 'pay', path: 'ebfs-pay' }, { name: 'ebfs-account', path: 'ebfs-account' }, { name: 'gateway', path: 'ebfs-gateway' }] }])
+})

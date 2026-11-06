@@ -1,5 +1,5 @@
 /** Compact, bounded model-facing projections of triggers, tickets, threads, and decisions; full texts stay behind readable resources. */
-import { latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
+import { latestReport, reasonText, threadKey, ticketStage, worktreesOf, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
   type Trigger, type TriggerDisposition } from '../core/index.ts'
 import { pullOf } from '../sources/github-pull.ts'
 import { batchLine, inputResource } from '../executor/dsh.ts'
@@ -23,13 +23,22 @@ function cardState(ticket: Ticket): TicketCardState {
   if (stage.stage === 'person') return `person/${stage.action}`
   return stage.stage === 'idle' ? 'idle' : stage.stage === 'working' && stage.action ? 'working/queued' : 'working'
 }
+/** Worktrees a person can review. One repository stays `worktree`; several services are listed one by one. */
+function worktreeCard(ticket: Ticket): Record<string, unknown> {
+  const trees = worktreesOf(ticket.execution).filter(tree => !tree.error)
+  if (!trees.length) return {}
+  const line = (tree: typeof trees[number]) => ({ ...tree.service ? { service: tree.service } : {}, path: tree.path, branch: tree.branch,
+    ...tree.removedAt ? { removed: true } : {} })
+  if (trees.length === 1) return { worktree: line(trees[0]!) }
+  return { worktrees: trees.map(line) }
+}
 export function ticketCard(ticket: Ticket) {
   const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
     ...ticket.execution?.access === 'read-only' ? { access: 'read-only' as const } : {},
-    ...ticket.execution?.worktree && !ticket.execution.worktree.error ? { worktree: { path: ticket.execution.worktree.path, branch: ticket.execution.worktree.branch,
-      ...ticket.execution.worktree.removedAt ? { removed: true } : {} } } : {},
+    ...ticket.execution?.services?.length ? { services: ticket.execution.services.map(service => service.name) } : {},
+    ...worktreeCard(ticket),
     ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
     preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }

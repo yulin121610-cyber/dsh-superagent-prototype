@@ -304,6 +304,59 @@ Changing a binding does not move existing tickets or their Sessions. A missing, 
 
 Project locks cover starting workers, active turns, and their background work. Read-only tickets share locks and worktree-isolated writers take none; any other writer excludes both readers and writers on overlapping roots. After a ticket ends, a clean worktree whose branch has no commit outside HEAD is removed with its branch; one with uncommitted changes or unmerged commits stays until a person merges or removes it (`git worktree remove`, `git branch -D`). Overlapping project roots share a lock. The global `executor.maxWorkers` limit still applies; a queued ticket waiting for its project does not prevent an independent project from starting. Unbound write tickets and legacy tickets, whose project was never frozen, run exclusively without changing their original directory.
 
+### Services under a group project
+
+A group binding can list services inside its project. Each service is a `name` and a `path` relative to `projectPath` (no `..`). The saved list is the source of truth. **Sources → Feishu → Chats → Discover services** suggests candidates and does not save them until you save the form: child directories that are their own git repositories, or, when the root is one git repository and no child is, the top-level directories except shared names such as `docs`, `openspec`, `scripts`, `logs`, `tmp` and `output`.
+
+Two layouts:
+
+```json
+{
+  "chatId": "oc_shop",
+  "listen": "mentions",
+  "projectPath": "/Users/me/work/shop",
+  "services": [
+    { "name": "shop-account", "path": "shop-account" },
+    { "name": "shop-pay", "path": "shop-pay" },
+    { "name": "shop-gateway", "path": "shop-gateway" },
+    { "name": "shop-web", "path": "shop-web" },
+    { "name": "shop-app", "path": "shop-app" },
+    { "name": "shop-site", "path": "shop-site" }
+  ]
+}
+```
+
+`shop` is not itself a git repository. Each service is a sibling repository. Non-git directories such as `docs` stay shared files, not services.
+
+```json
+{
+  "chatId": "oc_admin",
+  "listen": "mentions",
+  "projectPath": "/Users/me/work/admin",
+  "services": [
+    { "name": "admin-server", "path": "admin-server" },
+    { "name": "admin-common", "path": "admin-common" },
+    { "name": "admin-web", "path": "admin-web" }
+  ]
+}
+```
+
+`admin` is one git repository. The services are lock scopes inside that checkout. `docs`, `openspec`, `scripts`, `output` and `logs` are not services.
+
+When the candidate card lists `project_services`, accept with `services` set to the names the request touches (one or several; one ticket may span services). Omit `services`, or pass `["*"]`, when the request is unclear or covers the whole project. The choice is frozen on the ticket's execution, like `access`. A group with no `services` does not show the list, and the field is ignored: the lock stays `projectPath`, as in 0.1.0-local.10.
+
+Lock rules:
+
+- Read-only tickets share with other read-only tickets. A reader conflicts with a writer only when their scopes overlap.
+- Write tickets on different services run in parallel. The same service is exclusive while `executor.concurrentWrites` is off, and runs in separate worktrees while it is on.
+- A ticket that names several services acquires every one of them in one step, so two overlapping tickets cannot deadlock.
+- A whole-project ticket's scope is `projectPath`, so it conflicts with every service ticket that is using the shared checkout.
+- Writers whose services are subfolders of one git checkout are exclusive with each other even when the paths do not overlap, unless each is isolated in its own worktree. They share that checkout's git index, HEAD and branch, and workers may run git. File-disjoint edits are not enough. With `concurrentWrites` on, a monorepo ticket gets one worktree of the repository (not one per subfolder) and does not lock the checkout.
+- With `concurrentWrites` on, a multi-repo write ticket gets a worktree only for each touched repository that has a commit. The worker's directory is `<stateDir>/local-worktrees/services-<hash>/<ticket name>/`, with each service's worktree under its name and symlinks to the project's shared non-git files. Other git repositories are not linked. Cards, worker reports and ready replies list each worktree path and branch (`superagent/<ticket id>` on every repository). Follow-ups, resumes and restarts reuse them. Cleanup removes only a clean worktree with no commit outside that repository's HEAD, then removes the aggregate directory when nothing remains. Symlink targets are not deleted.
+- A service that is not a git repository, a repository with no commit, or a worktree that cannot be created degrades to exclusive access for that service. The worker does not start in the shared directory until that lock is held.
+
+Existing tickets have no `services` field and keep their project lock. GitHub mode and the outbox are unchanged. Adding or editing a group's services affects only tickets accepted afterward.
+
 ## Feishu replies rooted at an accepted reply
 
 A Feishu request may itself reply to a forwarded message. The bot then replies in a new topic rooted at that request. Incoming topic replies associate that topic with the ticket whose originating request is the retained root/parent message, within the same source chat. Other tickets sharing the earlier quoted thread are not added. The association is also repaired during duplicate history reads, without delivering the same input twice. Human-stopped tickets do not gain new topic subscriptions. Existing ticket follow-ups use their own admission and access; unrelated unmentioned messages remain inferred candidates constrained by the enabled rules.
