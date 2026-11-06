@@ -20,13 +20,34 @@ const MembersSchema = z.looseObject({
   users: z.array(z.looseObject({ member_id: z.string(), name: z.string() })),
   has_more: z.boolean(), truncations: z.array(z.unknown()).optional(),
 })
+const ServiceName = z.string().trim().min(1).max(41).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'Use a short service name of letters, digits, dots, underscores or hyphens')
+const ServicePath = z.string().trim().min(1).max(200).refine(path => {
+  if (isAbsolute(path) || path.includes('\\')) return false
+  const parts = path.split('/')
+  return parts.every(part => part.length > 0 && part !== '.' && part !== '..')
+}, 'Service path must be a relative directory inside the project')
+const ChatSchema = z.object({
+  chatId: z.string().regex(/^oc_[a-zA-Z0-9]+$/), name: z.string().trim().max(60).optional(), listen: z.enum(['mentions', 'all']),
+  projectPath: z.string().trim().refine(path => path === '' || isAbsolute(path), 'Project path must be absolute').optional(),
+  services: z.array(z.object({ name: ServiceName, path: ServicePath }).strict()).max(80).optional(),
+}).strict().superRefine((chat, ctx) => {
+  const services = chat.services ?? []
+  if (services.length && !chat.projectPath?.trim()) ctx.addIssue({ code: 'custom', message: 'Services require a project directory', path: ['services'] })
+  const names = new Set<string>(), paths = new Set<string>()
+  for (const [index, service] of services.entries()) {
+    if (names.has(service.name)) ctx.addIssue({ code: 'custom', message: 'Duplicate service name', path: ['services', index, 'name'] })
+    if (paths.has(service.path)) ctx.addIssue({ code: 'custom', message: 'Duplicate service path', path: ['services', index, 'path'] })
+    names.add(service.name); paths.add(service.path)
+  }
+  for (const path of paths) if ([...paths].some(other => other !== path && other.startsWith(`${path}/`))) {
+    ctx.addIssue({ code: 'custom', message: 'Service paths must not contain one another', path: ['services'] })
+    break
+  }
+})
 const FeishuConfigSchema = FeishuBotSchema.extend({
   readPageSize: z.number().int().min(1).max(50).default(20),
   linkTimeoutMs: z.number().int().min(1).max(90000).default(5000),
-  chats: z.array(z.object({
-    chatId: z.string().regex(/^oc_[a-zA-Z0-9]+$/), name: z.string().trim().max(60).optional(), listen: z.enum(['mentions', 'all']),
-    projectPath: z.string().trim().refine(path => path === '' || isAbsolute(path), 'Project path must be absolute').optional(),
-  }).strict())
+  chats: z.array(ChatSchema)
     .refine(chats => new Set(chats.map(chat => chat.chatId)).size === chats.length, 'Duplicate chat IDs')
     .refine(chats => {
       const paths = chats.flatMap(chat => {
@@ -50,12 +71,21 @@ export const feishuKind: SourceKind<FeishuConfig> = {
     { key: 'cli', type: 'text', label: { zh: '机器人的 lark-cli', en: 'Bot lark-cli' },
       hint: { zh: '命令名或绝对路径，指向只允许机器人身份（strict mode bot）的 lark-cli 配置；执行器以 lark-cli 调用它。保存时读取应用和机器人，然后重启 dsh-superagent。', en: 'A command name or absolute path of a lark-cli configuration that allows only the bot identity (strict mode bot); the Executor calls it as lark-cli. Saving reads the app and the bot, then restarts dsh-superagent.' } },
     { key: 'chats', type: 'rows', label: { zh: '接收的群', en: 'Chats' },
-      hint: { zh: '“仅 @”只接收 @ 机器人的消息和已有工单的线程；“全部消息”也接收其余消息，评估可以按规则从中推断工作，需要机器人有读取全部消息的权限。项目目录用于本地工作区模式，填现有目录的绝对路径；新工单固定在对应项目中执行。', en: '"@ only" receives messages that mention the bot and Threads that have Tickets; "All" also receives the rest, from which Eval may infer work under the rules; the bot needs permission to read all messages. In local workspace mode, an optional existing absolute project directory fixes where new tickets from the group run.' },
+      hint: { zh: '“仅 @”只接收 @ 机器人的消息和已有工单的线程；“全部消息”也接收其余消息，评估可以按规则从中推断工作，需要机器人有读取全部消息的权限。项目目录用于本地工作区模式，填现有目录的绝对路径；新工单固定在对应项目中执行。服务是该目录下的子目录，保存的名单才生效。', en: '"@ only" receives messages that mention the bot and Threads that have Tickets; "All" also receives the rest, from which Eval may infer work under the rules; the bot needs permission to read all messages. In local workspace mode, an optional existing absolute project directory fixes where new tickets from the group run. Services are directories under it; the saved list is what tickets use.' },
       columns: [
         { key: 'chatId', type: 'text', label: { zh: '群', en: 'Chat' }, pattern: 'oc_[a-zA-Z0-9]+', choose: { zh: '选择机器人已加入的群', en: 'Choose a chat the bot has joined' }, refresh: { zh: '刷新群列表', en: 'Refresh chats' } },
         { key: 'listen', type: 'select', label: { zh: '接收', en: 'Receive' }, options: [{ value: 'mentions', label: { zh: '仅 @', en: '@ only' } }, { value: 'all', label: { zh: '全部消息', en: 'All' } }] },
         { key: 'projectPath', type: 'text', optional: true, label: { zh: '项目目录', en: 'Project directory' }, pattern: '^/.*$' },
-      ] },
+      ],
+      nested: {
+        key: 'services', label: { zh: '服务', en: 'Services' },
+        hint: { zh: '项目下的服务：多仓库时每个服务是自己的 git 仓库，单体仓库时是仓库里的子目录。发现服务只列出候选，保存后的名单才是接单依据。不填则工单锁整个项目。', en: 'Services under the project: in a multi-repo layout each is its own git repository; in a monorepo each is a subdirectory. Discover only suggests candidates; the saved list is what acceptance uses. Leave it empty to lock the whole project.' },
+        discover: { zh: '发现服务', en: 'Discover services' },
+        columns: [
+          { key: 'name', type: 'text', label: { zh: '服务名', en: 'Service' }, pattern: '[A-Za-z0-9][A-Za-z0-9._-]*' },
+          { key: 'path', type: 'text', label: { zh: '相对路径', en: 'Relative path' }, pattern: '(?!\\.\\.)(?!/)[A-Za-z0-9._-]+(?:/(?!\\.\\.)[A-Za-z0-9._-]+)*' },
+        ],
+      } },
     { key: 'otherChats', type: 'select', label: { zh: '其他群', en: 'Other chats' }, options: [{ value: 'none', label: { zh: '不接收', en: 'Not received' } }, { value: 'mentions', label: { zh: '仅 @', en: '@ only' } }],
       hint: { zh: '机器人已加入、但没列在上面的群。“仅 @”接收那里 @ 机器人的消息；谁的消息能发起工作看策略里的准入。', en: 'Chats the bot has joined that are not listed above. "@ only" receives messages there that mention the bot; whose messages may originate work is the Policy\'s admission.' } },
     { key: 'directMessages', type: 'switch', label: { zh: '接收私聊', en: 'Direct messages' } },

@@ -4,10 +4,9 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { existsSync } from 'node:fs'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
-import { dirname, join, sep } from 'node:path'
-import { isolatedExecution, key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
-import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
-  from '../core/index.ts'
+import { dirname, join } from 'node:path'
+import { claimsConflict, key, latestAssignment, latestReport, liveTicket, lockClaim, runningAssignment, threadKey, waitsForPerson, worktreesOf,
+  type AssessmentOutcome, type Assignment, type EngineForExecutor, type Execution, type Executor, type Mandate, type PolicyEffect, type Ticket, type TicketInput, type Trigger, type WorktreeRecord } from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
 import type { Settings } from '../policy.ts'
@@ -16,8 +15,8 @@ import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
-import { boundProjectPath, existingProjectPath } from './project-routing.ts'
-import { ensureWorktree, planWorktree, removeCleanWorktree } from './worktrees.ts'
+import { boundProjectPath, boundServices, existingProjectPath, freezeServices } from './project-routing.ts'
+import { aggregateLinks, ensureAggregate, ensureWorktree, planServices, planWorktree, removeAggregate, removeCleanWorktree } from './worktrees.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
@@ -169,8 +168,10 @@ export function inputMessage(input: TicketInput, trigger?: object): string | und
  * Tracks active and starting worker sessions against the configured concurrency limit: a ticket holds a slot while its
  * worker's turn runs, while its shell jobs or subagents run after that turn ended, and while a launch or wake starts that worker.
  * DshExecutor reserves slots synchronously before awaiting launch or wake work so two starts cannot take the last slot,
- * and optionally allows one extra slot for human follow-ups. Local workers also lock their project, without overflow; a write
- * ticket isolated in its own git worktree (`isolated`) takes no project lock and only counts against the total limit.
+ * and optionally allows one extra slot for human follow-ups. Local workers also lock their project, without overflow. A write
+ * ticket isolated in its own git worktree takes no project lock. A ticket scoped to services locks each of them, all or none,
+ * so two overlapping sets cannot deadlock. A group with no services, and a ticket accepted for the whole project, lock
+ * `projectPath` as before.
  */
 export class WorkerSlots {
   /** Tickets currently holding a startup slot, mapped to whether the start is a launch, a wake, or a wake for a person's message. */
@@ -178,11 +179,14 @@ export class WorkerSlots {
   /**
    * @param running - Returns the ticket IDs whose worker holds a slot (see `DshExecutor.running`).
    * @param max - Returns the configured maximum number of concurrent worker slots.
+   * @param project - Legacy single-path lock. Ignored when `claim` is set.
+   * @param claim - The frozen lock claim of a ticket. When set, service scopes and shared-checkout repositories are honored.
    */
   constructor(private readonly running: () => string[], private readonly max: () => number, private readonly humanOverflow = true,
     private readonly project?: (ticketId: string) => string | undefined,
     private readonly readOnly: (ticketId: string) => boolean = () => false,
-    private readonly isolated: (ticketId: string) => boolean = () => false) {}
+    private readonly isolated: (ticketId: string) => boolean = () => false,
+    private readonly claim?: (ticketId: string) => ReturnType<typeof lockClaim> | undefined) {}
   /** Number of slots currently in use across running workers and starting reservations. */
   used(): number { return new Set([...this.running(), ...this.starting.keys()]).size }
   /** How many launches may run concurrently: the slots not held by a running worker or a wake reservation. */
@@ -198,16 +202,12 @@ export class WorkerSlots {
    */
   reserve(ticketId: string, by: 'launch' | 'wake' | 'person'): void {
     if (this.starting.has(ticketId)) return
-    if (this.project) {
-      const project = this.project(ticketId)
-      // A worker in its own worktree writes outside every project checkout, so it neither waits for nor blocks a project.
-      const isolated = this.isolated(ticketId)
+    if (this.claim || this.project) {
+      const mine = this.claimOf(ticketId)
       for (const other of new Set([...this.running(), ...this.starting.keys()])) {
-        if (other === ticketId || isolated || this.isolated(other) || (this.readOnly(ticketId) && this.readOnly(other))) continue
-        const held = this.project(other)
-        // An unbound/legacy ticket can access the whole shared workspace; overlapping roots also share a lock.
-        const contains = (parent: string, child: string) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep)
-        if (!project || !held || contains(project, held) || contains(held, project)) throw new Later('Project workspace is busy')
+        if (other === ticketId) continue
+        // Acquired together: a multi-service ticket takes every scope or waits, so two orders cannot deadlock.
+        if (claimsConflict(mine, this.claimOf(other))) throw new Later('Project workspace is busy')
       }
     }
     if (this.used() >= this.max() + (by === 'person' && this.humanOverflow ? 1 : 0)) throw new Later('No worker slot is free')
@@ -215,6 +215,12 @@ export class WorkerSlots {
   }
   /** Releases `ticketId`'s starting slot once its worker session is running or the launch/wake attempt has ended. */
   free(ticketId: string): void { this.starting.delete(ticketId) }
+  /** The claim `claim` returns, or the single project path the older constructor described. */
+  private claimOf(ticketId: string): ReturnType<typeof lockClaim> {
+    if (this.claim) return this.claim(ticketId) ?? { readOnly: false, isolated: false }
+    const project = this.project?.(ticketId)
+    return { readOnly: this.readOnly(ticketId), isolated: this.isolated(ticketId), ...project ? { scopes: [project] } : {} }
+  }
 }
 
 /**
@@ -250,9 +256,8 @@ export class DshExecutor implements Executor {
       ...host.machine.localWorkspace ? this.stopping.keys() : [],
     ])],
       () => host.store.settings().executor.maxWorkers, !host.machine.localWorkspace,
-      host.machine.localWorkspace ? ticketId => host.store.tickets.get(ticketId)?.execution?.projectPath : undefined,
-      ticketId => host.store.tickets.get(ticketId)?.execution?.access === 'read-only',
-      ticketId => !!host.machine.localWorkspace && isolatedExecution(host.store.tickets.get(ticketId)?.execution))
+      undefined, () => false, () => false,
+      host.machine.localWorkspace ? ticketId => lockClaim(host.store.tickets.get(ticketId)?.execution) : undefined)
     // Each launch reserves a worker slot so launches run concurrently while slots are free.
     host.effects.handle('launch', payload => this.launchQueued(payload), { limit: () => host.paused() ? 0 : this.slots.launches(),
       retry: [5000, 300_000] })
@@ -262,65 +267,121 @@ export class DshExecutor implements Executor {
   /** Populates a newly accepted ticket's `execution` attributes (worktree name, workspace directory, and assignment text). */
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
     const settings = this.host.store.settings()
-    const projectPath = boundProjectPath(settings, sourceTrigger(this.host, ticket), this.host.machine.localWorkspace)
+    const trigger = sourceTrigger(this.host, ticket)
+    const projectPath = boundProjectPath(settings, trigger, this.host.machine.localWorkspace)
     const execution = ticketExecution(ticket, outcome, settings, this.host.machine.stateDir, projectPath ?? this.host.machine.localWorkspace)
     const readOnly = outcome.access === 'read-only'
+    // Frozen at acceptance, like access: a later edit of the group's list does not move this ticket.
+    const services = projectPath ? freezeServices(projectPath, boundServices(settings, trigger), outcome.services) : undefined
     // With concurrent writes on, a local write ticket on a bound git project runs in its own worktree outside the project; any other keeps the project lock.
-    // Frozen at acceptance: turning the setting off later leaves tickets that have a worktree in it.
-    const planned = this.host.machine.localWorkspace && projectPath && !readOnly && settings.executor.concurrentWrites
-      // Under the state directory, never the executor directory setting, which local installations may point into a project.
-      ? planWorktree(join(this.host.machine.stateDir, 'local-worktrees'), projectPath, ticket.id, execution.name) : undefined
-    return { ...ticket, execution: { ...execution, ...projectPath ? { projectPath } : {}, ...readOnly ? { access: 'read-only' } : {},
-      ...planned ? { directory: planned.directory, worktree: planned.worktree } : {} } }
+    // The choice is frozen here: turning the setting off later leaves tickets that have a worktree in it. Read-only tickets stay in the project.
+    const root = join(this.host.machine.stateDir, 'local-worktrees')
+    const planned = this.host.machine.localWorkspace && projectPath && !readOnly
+      ? services?.length
+        ? planServices(root, projectPath, ticket.id, execution.name, services, !!settings.executor.concurrentWrites)
+        : settings.executor.concurrentWrites ? planWorktree(root, projectPath, ticket.id, execution.name) : undefined
+      : undefined
+    return { ...ticket, execution: { ...execution, ...projectPath ? { projectPath } : {}, ...readOnly ? { access: 'read-only' as const } : {},
+      ...services?.length ? { services } : {},
+      ...planned ? { directory: planned.directory, ...('worktree' in planned && planned.worktree ? { worktree: planned.worktree } : {}),
+        ...('worktrees' in planned && planned.worktrees ? { worktrees: planned.worktrees } : {}),
+        ...('aggregate' in planned && planned.aggregate ? { aggregate: planned.aggregate } : {}) } : {} } }
+  }
+  /** The ticket's execution as last saved, which a worktree fallback may have replaced since `ticket` was read. */
+  private fresh(ticketId: string): Execution | undefined { return this.host.store.tickets.get(ticketId)?.execution }
+  /** Whether the working directory and every worktree that was created are present. */
+  private workspaceReady(execution: Execution | undefined): boolean {
+    if (!execution?.directory || !existsSync(execution.directory)) return false
+    return worktreesOf(execution).filter(tree => !tree.error).every(tree => existsSync(tree.path))
   }
   /**
-   * Creates or reuses an isolated ticket's worktree. When it cannot, and `fallBack` holds, the ticket moves to its project
-   * directory under the exclusive project lock (recorded in `worktree.error`) and its launch waits for that lock (`Later`);
-   * it never writes to the project directory without the lock.
+   * Creates or reuses a ticket's worktrees, then the aggregate directory that links them together. When one cannot be
+   * created and `fallBack` holds, that service is recorded with `error` and the launch waits (`Later`) so the slot is
+   * taken again under the exclusive lock. It never writes the shared checkout without that lock.
    * @throws PrepareFailed when the bound project itself is unavailable.
    */
-  private async prepareWorktree(ticket: Ticket, fallBack: boolean): Promise<void> {
-    const execution = ticket.execution!, worktree = execution.worktree!, projectPath = execution.projectPath!
+  private async prepareWorktrees(ticket: Ticket, fallBack: boolean): Promise<void> {
+    const execution = this.fresh(ticket.id) ?? ticket.execution!
+    const projectPath = execution.projectPath!
     try { if (existingProjectPath(projectPath) !== projectPath) throw new Error('Workspace changed') }
     catch { throw new PrepareFailed('Local workspace changed or is unavailable; do not create a replacement directory.') }
+    const trees = worktreesOf(execution).filter(tree => !tree.error)
+    let failed: { tree: WorktreeRecord; reason: string } | undefined
     try {
-      const { base } = await ensureWorktree(worktree, execution.directory)
-      this.updateWorktree(ticket.id, current => ({ ...current, ...base ? { base } : {}, removedAt: undefined }))
+      for (const tree of trees) {
+        const inside = !tree.service && execution.directory !== tree.path ? execution.directory : tree.path
+        try {
+          const { base } = await ensureWorktree(tree, inside)
+          this.patchTree(ticket.id, tree.path, current => ({ ...current, ...base ? { base } : {}, removedAt: undefined }))
+        } catch (error) {
+          failed = { tree, reason: error instanceof Error ? error.message : String(error) }
+          throw error
+        }
+      }
+      const current = this.fresh(ticket.id) ?? execution
+      if (current.aggregate && current.services?.length) {
+        const links = aggregateLinks(current.aggregate.path, current.services, worktreesOf(current))
+        for (const link of links) if (link.link && !existsSync(link.target)) throw new PrepareFailed(`Service directory is unavailable: ${link.target}`)
+        await ensureAggregate(projectPath, current.aggregate.path, links)
+      }
     } catch (error) {
-      if (!fallBack || this.host.closing()) throw error
-      const reason = error instanceof Error ? error.message : String(error)
-      this.host.store.atomic(() => {
-        const stored = this.host.store.tickets.get(ticket.id)
-        if (!stored?.execution?.worktree) return
-        this.host.store.tickets.save({ ...stored, execution: { ...stored.execution, directory: projectPath, worktree: { ...stored.execution.worktree, error: reason } } })
-      })
-      throw new Later(`The worktree could not be created, so the ticket waits for exclusive project access: ${reason}`)
+      if (!failed || !fallBack || this.host.closing()) throw error
+      this.degrade(ticket.id, failed.tree, failed.reason)
+      throw new Later(`The worktree could not be created, so the ticket waits for exclusive access: ${failed.reason}`)
     }
   }
-  /** Rewrites a ticket's stored worktree record. */
-  private updateWorktree(ticketId: string, change: (worktree: NonNullable<Execution['worktree']>) => NonNullable<Execution['worktree']>): void {
+  /** Records that `tree` could not be created, and moves a ticket with no remaining worktree back to a shared directory. */
+  private degrade(ticketId: string, tree: WorktreeRecord, reason: string): void {
     this.host.store.atomic(() => {
       const stored = this.host.store.tickets.get(ticketId)
-      if (!stored?.execution?.worktree) return
-      this.host.store.tickets.save({ ...stored, execution: { ...stored.execution, worktree: change(stored.execution.worktree) } })
+      const execution = stored?.execution
+      if (!execution) return
+      const mark = (record: WorktreeRecord): WorktreeRecord => record.path === tree.path ? { ...record, error: reason } : record
+      const next: Execution = { ...execution, ...execution.worktree ? { worktree: mark(execution.worktree) } : {},
+        ...execution.worktrees ? { worktrees: execution.worktrees.map(mark) } : {} }
+      if (worktreesOf(next).some(item => !item.error)) { this.host.store.tickets.save({ ...stored!, execution: next }); return }
+      const services = next.services ?? []
+      const directory = !services.length ? next.projectPath ?? next.directory : services.length === 1 ? services[0]!.path : next.aggregate?.path ?? next.projectPath ?? next.directory
+      if (services.length > 1 && next.aggregate) { this.host.store.tickets.save({ ...stored!, execution: { ...next, directory } }); return }
+      const { aggregate: _aggregate, ...rest } = next
+      this.host.store.tickets.save({ ...stored!, execution: { ...rest, directory } })
+    })
+  }
+  /** Rewrites the worktree record whose path is `path`. */
+  private patchTree(ticketId: string, path: string, change: (tree: WorktreeRecord) => WorktreeRecord): void {
+    this.host.store.atomic(() => {
+      const stored = this.host.store.tickets.get(ticketId)
+      const execution = stored?.execution
+      if (!execution) return
+      const apply = (tree: WorktreeRecord) => tree.path === path ? change(tree) : tree
+      this.host.store.tickets.save({ ...stored!, execution: { ...execution, ...execution.worktree ? { worktree: apply(execution.worktree) } : {},
+        ...execution.worktrees ? { worktrees: execution.worktrees.map(apply) } : {} } })
     })
   }
   /**
-   * After an ended ticket's worker stopped, removes its worktree and branch only when they hold no uncommitted change and no
-   * commit outside the project's HEAD; anything else stays for a person to review and merge. A resume recreates it.
+   * After an ended ticket's worker stopped, removes each worktree and branch only when they hold no uncommitted change and
+   * no commit outside the repository's HEAD; anything else stays for a person to review and merge. A resume recreates it.
+   * An aggregate directory is removed once nothing of the ticket remains in it. Symlink targets are not deleted.
    */
   private cleanUp(ticketId: string): void {
-    const worktree = this.host.store.tickets.get(ticketId)?.execution?.worktree
-    if (!this.host.machine.localWorkspace || !worktree || worktree.error || worktree.removedAt) return
+    const execution = this.fresh(ticketId)
+    if (!this.host.machine.localWorkspace || !execution) return
+    const trees = worktreesOf(execution).filter(tree => !tree.error && !tree.removedAt)
+    if (!trees.length && !execution.aggregate) return
     const ended = () => !!this.host.store.tickets.get(ticketId)?.ended
     if (!ended()) return
     void (async () => {
       await this.stopped(ticketId)
       const agent = this.host.context.agents.get(workerSessionId(ticketId) as SessionId)
       if (agent) await until(agent.whenIdle(), this.host.lifetime, SHUTDOWN_STOP_MS)
-      if (this.host.closing()) return
-      const result = await removeCleanWorktree(worktree, () => !ended())
-      if (result.removed) this.updateWorktree(ticketId, current => ({ ...current, removedAt: now() }))
+      if (this.host.closing() || !ended()) return
+      for (const tree of trees) {
+        const result = await removeCleanWorktree(tree, () => !ended())
+        if (result.removed) this.patchTree(ticketId, tree.path, current => ({ ...current, removedAt: now() }))
+      }
+      const current = this.fresh(ticketId)
+      const kept = worktreesOf(current).some(tree => !tree.error && !tree.removedAt)
+      if (current?.aggregate && !kept && ended()) await removeAggregate(current.aggregate.path)
     })().catch(() => { /* A worktree that could not be removed stays, which loses nothing. */ })
   }
   /**
@@ -330,13 +391,17 @@ export class DshExecutor implements Executor {
    * @throws PrepareFailed with the command's output when the prepare command fails.
    */
   private async prepareDirectory(ticket: Ticket): Promise<void> {
-    const directory = ticket.execution?.directory ?? ''
-    const projectPath = ticket.execution?.projectPath
+    const execution = this.fresh(ticket.id) ?? ticket.execution
+    const directory = execution?.directory ?? ''
+    const projectPath = execution?.projectPath
     if (projectPath || this.host.machine.localWorkspace) {
-      if (projectPath && this.host.machine.localWorkspace && isolatedExecution(ticket.execution)) { await this.prepareWorktree(ticket, true); return }
+      if (projectPath && this.host.machine.localWorkspace && (worktreesOf(execution).some(tree => !tree.error) || execution?.aggregate)) {
+        await this.prepareWorktrees(ticket, true); return
+      }
       try {
         const expected = projectPath ?? this.host.machine.localWorkspace
-        if (directory !== expected || !(await stat(directory)).isDirectory() || (projectPath && existingProjectPath(projectPath) !== projectPath)) throw new Error('Workspace changed')
+        const serviceDirectory = execution?.services?.some(service => service.path === directory) === true
+        if ((!serviceDirectory && directory !== expected) || !(await stat(directory)).isDirectory() || (projectPath && existingProjectPath(projectPath) !== projectPath)) throw new Error('Workspace changed')
       } catch { throw new PrepareFailed('Local workspace changed or is unavailable; do not create a replacement directory.') }
       return
     }
@@ -406,8 +471,8 @@ export class DshExecutor implements Executor {
         try {
           // Recreate an isolated worker's worktree if it was removed meanwhile, never falling back to the project directory
           // its Session already works in.
-          if (this.host.machine.localWorkspace && isolatedExecution(ticket.execution) && !existsSync(ticket.execution!.directory)) {
-            await this.prepareWorktree(ticket, false)
+          if (this.host.machine.localWorkspace && !this.workspaceReady(ticket.execution) && worktreesOf(ticket.execution).some(tree => !tree.error)) {
+            await this.prepareWorktrees(ticket, false)
           }
           // Recreate the worker session if it was externally deleted.
           if (!this.host.context.agents.get(sessionId as SessionId)) {
@@ -529,13 +594,13 @@ export class DshExecutor implements Executor {
       return !!stored && liveTicket(stored) && latestAssignment(stored)?.id === assignment.id
     }
     const source = sourceTrigger(this.host, ticket)
-    const workspace = ticket.execution?.directory ?? ''
     if (!current()) return
     // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
-    if (!await stat(workspace).then(() => true, () => false)) {
+    if (!this.workspaceReady(ticket.execution)) {
       await this.prepareDirectory(ticket)
       if (!current()) return
     }
+    const workspace = this.fresh(ticket.id)?.directory ?? ticket.execution?.directory ?? ''
     if (!current()) return
     const sessionId = workerSessionId(ticket.id)
     const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')

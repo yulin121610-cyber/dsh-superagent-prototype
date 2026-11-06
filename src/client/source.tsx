@@ -27,7 +27,7 @@ function SourceCard({ source }: { source: SourceView }) {
   const description = localized(t, source.description)
   // Hide derived facts for unsaved field edits until the new value is saved.
   const field = (spec: FieldSpec) => <SourceField key={spec.key} field={spec} value={value.config[spec.key]} saved={saved.config[spec.key]}
-    labels={source.labels}
+    labels={source.labels} sourceId={source.id}
     refreshLabels={refreshLabels} fact={spec.type === 'fact' || !changed(spec.key) ? source.facts[spec.key] : undefined}
     onChange={next => draft.edit({ ...value, config: { ...value.config, [spec.key]: next } })} />
   const advanced = source.fields.filter(spec => spec.advanced)

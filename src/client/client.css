@@ -126,6 +126,10 @@ div.dt-preview-head { color: var(--dsw-alias-label-secondary); }
 .dt-row-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
 .dt-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .dt-rows-item { display: grid; grid-template-columns: repeat(var(--dt-columns), minmax(0, 1fr)) auto; gap: 8px; align-items: center; }
+.dt-rows-nested { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+.dt-rows-line { display: grid; grid-template-columns: repeat(var(--dt-columns), minmax(0, 1fr)) auto; gap: 8px; align-items: center; }
+.dt-rows-services { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 4px 12px; padding-left: 12px; border-left: 2px solid var(--dsw-alias-border-l2); }
+.dt-service-row { display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.4fr) auto; gap: 8px; align-items: center; }
 .dt-filter-gap { flex: 1; }
 .dt-page-head { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 .dt-page-head > .dt-btn { margin-left: -10px; }

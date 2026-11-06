@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { bindScopeParent } from '@deepseek-ai/dsh-scope'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
@@ -2190,4 +2190,181 @@ it('refuses a missing bound project instead of creating a worker in the default 
   await expect(route({ kind: 'accept', trigger_id: trigger.id, title: '分析', worktree_name: 'analyze-project', acknowledgement: '收到，开始分析。' })).rejects.toThrow('Project workspace')
   expect(controller.create).toHaveBeenCalledTimes(creates)
   expect(runtime.store.tickets.list()).toHaveLength(0)
+})
+
+/** A multi-repo root that is not a git repository, plus one monorepo. */
+function serviceLayout() {
+  const root = join(directory, 'all-projects'); mkdirSync(root)
+  const ebfs = join(root, 'ebfs'); mkdirSync(ebfs)
+  const pay = gitProject(join(ebfs, 'ebfs-pay'))
+  const account = gitProject(join(ebfs, 'ebfs-account'))
+  mkdirSync(join(ebfs, 'docs')); writeFileSync(join(ebfs, 'docs', 'guide.md'), 'guide\n')
+  writeFileSync(join(ebfs, 'README.md'), 'shared\n')
+  const other = gitProject(join(ebfs, 'other'))
+  const empty = join(ebfs, 'empty'); mkdirSync(empty)
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: empty, env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined } })
+  const otc = gitProject(join(root, 'otc'))
+  mkdirSync(join(otc, 'dealer')); mkdirSync(join(otc, 'web')); mkdirSync(join(otc, 'docs'))
+  writeFileSync(join(otc, 'dealer', 'a.txt'), 'a\n'); writeFileSync(join(otc, 'web', 'b.txt'), 'b\n')
+  execFileSync('git', ['add', '.'], { cwd: otc, env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined } })
+  execFileSync('git', ['commit', '-q', '-m', 'services'], { cwd: otc, env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.test', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.test' } })
+  return { ebfs: realpathSync(ebfs), pay, account, other, empty: realpathSync(empty), otc }
+}
+async function bindServices(project: string, services: { name: string; path: string }[], concurrentWrites = true): Promise<void> {
+  await bindProject(project, concurrentWrites)
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, maxWorkers: 8, concurrentWrites } })
+  const config = runtime.sources.instance('feishu')!.config
+  await runtime.settings.save('source:feishu', { enabled: true, config: { ...config, chats: [{ chatId: CHAT, listen: 'mentions', projectPath: project, services }] } }, runtime.store.blockRevision('source:feishu'), 'panel')
+}
+async function acceptServices(id: string, services?: string[], access?: 'read-only' | 'write') {
+  const trigger = feishu(id, `@bot ${id}`)
+  await receive(trigger)
+  const result = await route({ kind: 'accept', trigger_id: trigger.id, title: id, worktree_name: worktreeName, acknowledgement: '收到。',
+    ...access ? { access } : {}, ...services ? { services } : {} })
+  const ticket = runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
+  return { trigger, ticket, sessionId: `worker-${ticket.id}` }
+}
+
+it('freezes chosen services and runs different multi-repo writers together, including several services on one ticket', async () => {
+  const layout = serviceLayout()
+  const services = [{ name: 'ebfs-pay', path: 'ebfs-pay' }, { name: 'ebfs-account', path: 'ebfs-account' }, { name: 'empty', path: 'empty' }]
+  await bindServices(layout.ebfs, services, true)
+  const trigger = feishu('card', '@bot 看一下支付')
+  await receive(trigger)
+  const card = relays(runtime.masterId).filter(item => item.kind === 'candidate' && item.trigger_id === trigger.id).at(-1)!
+  expect(card.project_services).toEqual(services)
+  await route({ kind: 'ignore', trigger_id: trigger.id, reason: '只是确认名单' })
+  const pay = await acceptServices('pay1', ['ebfs-pay'])
+  const account = await acceptServices('acct1', ['ebfs-account'])
+  const again = await acceptServices('pay2', ['ebfs-pay'])
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  expect([state(pay.ticket.id), state(account.ticket.id), state(again.ticket.id)]).toEqual(['running', 'running', 'running'])
+  const payExecution = runtime.store.tickets.get(pay.ticket.id)!.execution!
+  const accountExecution = runtime.store.tickets.get(account.ticket.id)!.execution!
+  expect(payExecution.services).toEqual([{ name: 'ebfs-pay', path: layout.pay, repository: layout.pay }])
+  expect(payExecution.worktree).toMatchObject({ repository: layout.pay, branch: `superagent/${pay.ticket.id}`, service: 'ebfs-pay' })
+  expect(payExecution.directory).toBe(payExecution.worktree!.path)
+  expect(payExecution.directory.startsWith(layout.ebfs)).toBe(false)
+  expect(accountExecution.directory).not.toBe(payExecution.directory)
+  expect(gitOut(layout.pay, 'branch', '--show-current')).toBe('main')
+  expect(runtime.store.tickets.get(again.ticket.id)!.execution!.directory).not.toBe(payExecution.directory)
+  const both = await acceptServices('both', ['ebfs-pay', 'ebfs-account'])
+  expect(state(both.ticket.id)).toBe('running')
+  const span = runtime.store.tickets.get(both.ticket.id)!.execution!
+  expect(span.services?.map(service => service.name)).toEqual(['ebfs-pay', 'ebfs-account'])
+  expect(span.aggregate?.path).toBe(span.directory)
+  expect(span.worktrees?.map(tree => tree.service).sort()).toEqual(['ebfs-account', 'ebfs-pay'])
+  expect(gitOut(join(span.directory, 'ebfs-pay'), 'branch', '--show-current')).toBe(`superagent/${both.ticket.id}`)
+  expect(readFileSync(join(span.directory, 'docs', 'guide.md'), 'utf8')).toBe('guide\n')
+  expect(lstatSync(join(span.directory, 'docs')).isSymbolicLink()).toBe(true)
+  expect(existsSync(join(span.directory, 'other'))).toBe(false)
+  const variables = Object.fromEntries(runtime.ticketEnvironment(runtime.store.tickets.get(both.ticket.id)!).map(item => [item.key, item.value]))
+  expect(JSON.parse(variables.DSH_SUPERAGENT_SERVICES!).map((service: { name: string }) => service.name)).toEqual(['ebfs-pay', 'ebfs-account'])
+  expect(JSON.parse(variables.DSH_SUPERAGENT_WORKTREES!)).toHaveLength(2)
+  expect(variables.DSH_SUPERAGENT_PROJECT).toBe(layout.ebfs)
+  expect(sections.get(both.sessionId)!.text({})).toContain('DSH_SUPERAGENT_WORKTREES lists each service worktree')
+  const reader = await acceptServices('readpay', ['ebfs-pay'], 'read-only')
+  expect(state(reader.ticket.id)).toBe('running')
+  expect(runtime.store.tickets.get(reader.ticket.id)!.execution).toMatchObject({ directory: layout.ebfs, access: 'read-only' })
+  const empty = await acceptServices('empty1', ['empty'])
+  expect(state(empty.ticket.id)).toBe('running')
+  expect(runtime.store.tickets.get(empty.ticket.id)!.execution).toMatchObject({ directory: layout.empty })
+  expect(runtime.store.tickets.get(empty.ticket.id)!.execution!.worktree).toBeUndefined()
+  const emptyAgain = await acceptServices('empty2', ['empty'])
+  expect(state(emptyAgain.ticket.id)).toBe('pending')
+  const before = runtime.store.tickets.list().length
+  await expect(acceptServices('nope', ['not-a-service'])).rejects.toThrow('Unknown service "not-a-service"')
+  expect(runtime.store.tickets.list()).toHaveLength(before)
+  const whole = await acceptServices('whole')
+  expect(runtime.store.tickets.get(whole.ticket.id)!.execution!.services).toBeUndefined()
+  expect(state(whole.ticket.id)).toBe('pending')
+  writeFileSync(join(payExecution.directory, 'README.md'), 'changed\n')
+  await runTool(pay.sessionId, 'orchestrator_report', { state: 'ready', summary: '支付已改。' })
+  const report = relays(runtime.masterId).filter(item => item.kind === 'worker_report' && (item.ticket as { ticket_id: string }).ticket_id === pay.ticket.id).at(-1)!
+  expect(report.ticket).toMatchObject({ services: ['ebfs-pay'], worktree: { path: payExecution.worktree!.path, branch: payExecution.worktree!.branch, service: 'ebfs-pay' } })
+  await receive(feishu('pay3', '@bot 继续支付', { root_id: 'om_pay1' }))
+  expect(runtime.store.tickets.get(pay.ticket.id)!.execution).toMatchObject({ directory: payExecution.directory, worktree: { path: payExecution.worktree!.path } })
+  expect(readFileSync(join(payExecution.directory, 'README.md'), 'utf8')).toBe('changed\n')
+})
+
+it('keeps different multi-repo services parallel and the same service exclusive while concurrent writes are off', async () => {
+  const layout = serviceLayout()
+  const services = [{ name: 'ebfs-pay', path: 'ebfs-pay' }, { name: 'ebfs-account', path: 'ebfs-account' }]
+  await bindServices(layout.ebfs, services, false)
+  const both = await acceptServices('offboth', ['ebfs-pay', 'ebfs-account'])
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  expect(state(both.ticket.id)).toBe('running')
+  const span = runtime.store.tickets.get(both.ticket.id)!.execution!
+  expect(span.aggregate?.path).toBe(span.directory)
+  expect(lstatSync(join(span.directory, 'ebfs-pay')).isSymbolicLink()).toBe(true)
+  expect(readFileSync(join(span.directory, 'docs', 'guide.md'), 'utf8')).toBe('guide\n')
+  expect(existsSync(join(span.directory, 'other'))).toBe(false)
+  await runTool(both.sessionId, 'orchestrator_report', { state: 'ready', summary: '两边都看过。' })
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+  try { await runtime.pump(); await runtime.idle() } finally { vi.useRealTimers() }
+  expect(runtime.store.tickets.get(both.ticket.id)!.ended).toBeDefined()
+  const pay = await acceptServices('offpay', ['ebfs-pay'])
+  const account = await acceptServices('offacct', ['ebfs-account'])
+  expect([state(pay.ticket.id), state(account.ticket.id)]).toEqual(['running', 'running'])
+  expect(runtime.store.tickets.get(pay.ticket.id)!.execution).toMatchObject({ directory: layout.pay, services: [{ name: 'ebfs-pay', path: layout.pay, repository: layout.pay }] })
+  expect(runtime.store.tickets.get(pay.ticket.id)!.execution!.worktree).toBeUndefined()
+  expect(gitOut(layout.pay, 'worktree', 'list').split('\n')).toHaveLength(1)
+  const same = await acceptServices('offpay2', ['ebfs-pay'])
+  expect(state(same.ticket.id)).toBe('pending')
+  const again = await acceptServices('offboth2', ['ebfs-account', 'ebfs-pay'])
+  expect(state(again.ticket.id)).toBe('pending')
+  const whole = await acceptServices('offwhole')
+  expect(state(whole.ticket.id)).toBe('pending')
+  expect(runtime.store.tickets.get(whole.ticket.id)!.execution!.services).toBeUndefined()
+  expect(runtime.store.tickets.get(whole.ticket.id)!.execution!.directory).toBe(layout.ebfs)
+})
+
+it('keeps monorepo service writers exclusive in the shared checkout and parallel in one worktree of the repository', async () => {
+  const layout = serviceLayout()
+  const services = [{ name: 'dealer', path: 'dealer' }, { name: 'web', path: 'web' }]
+  await bindServices(layout.otc, services, false)
+  const dealer = await acceptServices('dealer1', ['dealer'])
+  const web = await acceptServices('web1', ['web'])
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  expect([state(dealer.ticket.id), state(web.ticket.id)]).toEqual(['running', 'pending'])
+  expect(runtime.store.tickets.get(dealer.ticket.id)!.execution).toMatchObject({ directory: join(layout.otc, 'dealer'),
+    services: [{ name: 'dealer', path: join(layout.otc, 'dealer'), repository: layout.otc }] })
+  expect(gitOut(layout.otc, 'worktree', 'list').split('\n')).toHaveLength(1)
+  setConcurrentWrites(true)
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, maxWorkers: 8, concurrentWrites: true } })
+  const dealerAgain = await acceptServices('dealer2', ['dealer'])
+  const webAgain = await acceptServices('web2', ['web'])
+  expect([state(dealer.ticket.id), state(web.ticket.id), state(dealerAgain.ticket.id), state(webAgain.ticket.id)]).toEqual(['running', 'pending', 'running', 'running'])
+  const first = runtime.store.tickets.get(dealerAgain.ticket.id)!.execution!
+  const second = runtime.store.tickets.get(webAgain.ticket.id)!.execution!
+  expect(first.worktree).toMatchObject({ repository: layout.otc, branch: `superagent/${dealerAgain.ticket.id}` })
+  expect(second.worktree).toMatchObject({ repository: layout.otc })
+  expect(first.directory).toBe(first.worktree!.path)
+  expect(second.directory).not.toBe(first.directory)
+  expect(existsSync(join(first.directory, 'dealer', 'a.txt'))).toBe(true)
+  expect(existsSync(join(first.directory, 'web', 'b.txt'))).toBe(true)
+  expect(gitOut(layout.otc, 'branch', '--show-current')).toBe('main')
+})
+
+it('falls back to exclusive access for one service when its worktree cannot be created, and still runs the others', async () => {
+  const layout = serviceLayout()
+  const services = [{ name: 'ebfs-pay', path: 'ebfs-pay' }, { name: 'ebfs-account', path: 'ebfs-account' }]
+  await bindServices(layout.ebfs, services, true)
+  const reader = await acceptServices('fbread', ['ebfs-account'], 'read-only')
+  writeFileSync(join(directory, 'local-worktrees'), 'x')
+  const pay = await acceptServices('fbpay', ['ebfs-pay'])
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+  try { await runtime.pump(); await runtime.idle() } finally { vi.useRealTimers() }
+  expect(state(reader.ticket.id)).toBe('running')
+  expect(state(pay.ticket.id)).toBe('running')
+  expect(runtime.store.tickets.get(pay.ticket.id)!.execution).toMatchObject({ directory: layout.pay, worktree: { error: expect.any(String), service: 'ebfs-pay' } })
+  expect(controller.create).toHaveBeenCalledWith(expect.objectContaining({ sessionId: pay.sessionId, workspaceId: layout.pay }))
+  const same = await acceptServices('fbpay2', ['ebfs-pay'])
+  expect(state(same.ticket.id)).toBe('pending')
+  const account = await acceptServices('fbacct', ['ebfs-account'], 'write')
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+  try { await runtime.pump(); await runtime.idle() } finally { vi.useRealTimers() }
+  expect(state(account.ticket.id)).toBe('pending')
+  expect(state(pay.ticket.id)).toBe('running')
 })

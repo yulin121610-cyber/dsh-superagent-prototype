@@ -94,6 +94,8 @@ export interface PanelServer {
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
   person: TicketRow[]; search: Pick<ApiResponse<'GET search'>, 'items' | 'threads'>; history: HistoryView
   requests: { path: string; method: string; body?: unknown }[]
+  /** Candidates returned by service discovery for the Feishu settings row. */
+  discovered?: { name: string; path: string; kind: 'repo' | 'directory' }[]
   /** Requests with undeclared query params or invalid body presence; asserted empty after each test. */
   misuse: string[]
   queued: Set<string>
@@ -300,6 +302,8 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   } },
   'GET sources': { answer: sourceStatuses },
   'GET settings': { answer: settingsView },
+  'POST sources/:id/services': { body: true, answer: ({ params }) => params.id === 'feishu'
+    ? { services: server.discovered ?? [] } : refuse(404, 'Source not found') },
   'POST sources/:id/labels': { answer: () => {
     // Label refresh failures come from the bot CLI and are returned verbatim.
     if (server.joinError) return refuse(500, server.joinError)

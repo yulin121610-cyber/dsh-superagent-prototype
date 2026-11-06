@@ -21,6 +21,7 @@ import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
+import { discoverServices } from '../executor/project-routing.ts'
 import { policyHistory } from './settings-history.ts'
 import { overview } from './views/overview.ts'
 import { settingsView } from './views/settings.ts'
@@ -160,6 +161,12 @@ function routes(runtime: HttpHost): Routes {
     'GET sources': () => sourcesStatus(views(runtime), runtime.health, setupState(runtime)),
     'GET settings': () => settingsView(store, runtime.sources, runtime.health, setupState(runtime), runtime.machine.stateDir),
     'POST sources/:id/labels': ({ params }) => runtime.settings.refreshLabels(params.id),
+    'POST sources/:id/services': async ({ params, body }) => {
+      if (params.id !== 'feishu') throw new RouteError(404, 'Source not found')
+      const { projectPath } = z.object({ projectPath: z.string().min(1) }).parse(await body())
+      try { return { services: discoverServices(projectPath) } }
+      catch (error) { throw new RouteError(400, error instanceof Error ? error.message : String(error)) }
+    },
     'GET threads': ({ query }) => {
       const { filter, offset, limit } = ThreadsQuery.parse(query)
       return threadList(views(runtime), filter, offset, limit)
