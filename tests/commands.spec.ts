@@ -15,6 +15,28 @@ const send = (commands: Commands, message: OutboundMessage) => sources.send(mess
 const deployment = testDeployment({ github: { ...testDeployment().github, cli: '/path/agent-gh' } })
 const REPOSITORY = deployment.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
+it('retries a TAT rejection before sending, but never retries an uncertain write', async () => {
+  const value = new Commands(() => deployment, {}, new AbortController().signal)
+  const run = vi.spyOn(value, 'run').mockRejectedValueOnce(new CliError('TAT endpoint rate limited (HTTP 429)', 429))
+    .mockResolvedValueOnce('{"ok":true,"data":{"sent":true}}')
+  expect(await value.lark(['im', '+messages-reply'])).toEqual({ sent: true })
+  expect(run).toHaveBeenCalledTimes(2)
+  run.mockRejectedValueOnce(new CliError('request timed out'))
+  await expect(value.lark(['im', '+messages-reply'])).rejects.toThrow('request timed out')
+  expect(run).toHaveBeenCalledTimes(3)
+}, 15000)
+it('bounds TAT retries and lets shutdown cancel the wait', async () => {
+  const controller = new AbortController()
+  const value = new Commands(() => deployment, {}, controller.signal)
+  const error = new CliError('TAT endpoint rate limited (HTTP 429)', 429)
+  const run = vi.spyOn(value, 'run').mockRejectedValue(error)
+  await expect(value.lark(['im', '+chat-list'])).rejects.toBe(error)
+  expect(run).toHaveBeenCalledTimes(3)
+  const pending = value.lark(['im', '+chat-list'])
+  controller.abort()
+  await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+  expect(run).toHaveBeenCalledTimes(4)
+}, 20000)
 describe('account-isolated operations', () => {
   it('uses the agent account\'s GitHub CLI and preserves literal shell metacharacters in argv', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); const run = vi.spyOn(commands,'run').mockResolvedValue('{}')
@@ -64,6 +86,14 @@ it('reports Feishu failures with their code and without command arguments', () =
   const membership = commandError({stderr:'[page 1] fetching...\n'+JSON.stringify({error:{code:232011,message:'operator is not in the chat'}})})
   expect(membership).toMatchObject({ message: 'operator is not in the chat (232011)', code: 232011 })
   expect(commandError({stderr:JSON.stringify({error:{code:999,message:'scope missing'}})}).message).toBe('scope missing (999)')
+  expect(commandError({stderr:JSON.stringify({error:{code:429,message:'TAT endpoint rate limited',retry_after_seconds:12}})})).toMatchObject({ code:429, retryAfterSeconds:12 })
+})
+it('explains bot history denial without retrying or changing identity', async () => {
+  const value = new Commands(() => deployment, {}, new AbortController().signal)
+  const run = vi.spyOn(value, 'run').mockRejectedValue(new CliError('access denied for this bot operation', 230027))
+  await expect(value.lark(['im', '+threads-messages-list'])).rejects.toMatchObject({ code:230027, message:expect.stringContaining('history permissions') })
+  expect(run).toHaveBeenCalledTimes(1)
+  expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['--as', 'bot']))
 })
 describe('Channels', () => {
   const commands = () => new Commands(() => deployment, {}, new AbortController().signal)

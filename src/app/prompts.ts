@@ -80,8 +80,22 @@ const builtIn = (config: PromptConfig, part: PartKey): string =>
 const fill = (template: string, values: Record<string, string>): string =>
   template.replace(/\{(\w+)\}/g, (match, name: string) => Object.hasOwn(values, name) ? values[name]! : match)
 /** The execution environment part: its template with the variables, or, while setup waits, that it waits. */
-export function environmentSection(config: PromptConfig, variables: Variable[] | undefined): string {
-  return variables ? fill(builtIn(config, 'runtime/environment'), { variables: environmentLines(variables) })
+export function environmentSection(config: PromptConfig, variables: Variable[] | undefined, concurrentWrites = false): string {
+  const local = variables?.find(variable => variable.key === 'DSH_SUPERAGENT_LOCAL_WORKSPACE')
+  const project = variables?.some(variable => variable.key === 'DSH_SUPERAGENT_PROJECT')
+  const worktree = variables?.some(variable => variable.key === 'DSH_SUPERAGENT_WORKTREE')
+  // Worktree wording only while concurrent writes are on, or for a ticket that already has its worktree.
+  const isolation = concurrentWrites || worktree
+  const instructions = local ? '\n\n## Local workspace mode\n'
+    + 'This installation uses an existing local workspace, not GitHub. This section overrides GitHub, PR, branch and worktree assumptions elsewhere in the default prompts. '
+    + (isolation ? 'Read-only workers run directly in DSH_SUPERAGENT_LOCAL_WORKSPACE and may share a project. A write ticket on a group-bound git project runs in its own host-created git worktree outside the project, on branch superagent/<ticket id>, so several write tickets on one project, and read-only tickets beside them, run concurrently within the worker limit. A write ticket whose project is not a git repository, whose worktree could not be created, or that is unbound or legacy needs exclusive project access in the project directory. Independent write requests on one project are separate tickets. Do not clone, create worktrees yourself, initialize git in the workspace root, or run prepare commands. '
+      : 'Workers run directly in DSH_SUPERAGENT_LOCAL_WORKSPACE, read-only tickets may share a project, while a write ticket needs exclusive project access; different projects may run concurrently. Legacy and unbound write tickets use the shared workspace exclusively. Do not clone, create worktrees, initialize git in the workspace root, or run prepare commands. ')
+    + 'Read the workspace AGENTS.md and the nearest repository instructions first. Check git status inside each relevant child repository before changes; preserve existing branches and uncommitted work. '
+    + 'When accepting investigation, explanation, code review or a proposed plan without file changes, set orchestrator_route access to read-only. For implementation, mixed work or uncertain intent use write (the default). Access is frozen for the ticket. Analysis requests are read-only. Modify code only when the original authorized request asks for it. Do not commit, push, create merge requests, publish or deploy without explicit operator authorization. '
+    + 'Deliver findings, file paths, changes and actual validation results in the original conversation. ' + (isolation ? 'When a worker report\'s ticket names a worktree, the reply states its worktree path and branch so a person knows where to review and merge. ' : '') + 'Report ready without pr_number; no GitHub account or PR is required. '
+    + 'Never read or disclose secrets or production credentials.\n' : ''
+  return variables ? fill(builtIn(config, 'runtime/environment'), { variables: environmentLines(variables) }) + instructions + (project ? '\nThis ticket is bound to DSH_SUPERAGENT_PROJECT by its source group. Treat that project as the target and read its AGENTS.md first. If the request belongs to a different project, report the mismatch and ask before switching projects.\n' : '')
+    + (worktree ? '\nThis write ticket runs in its own git worktree DSH_SUPERAGENT_WORKTREE on branch DSH_SUPERAGENT_BRANCH, created by the host from the project HEAD; DSH_SUPERAGENT_DIR is the project inside it. Make every change there and never edit, check out, reset or stash in the DSH_SUPERAGENT_PROJECT checkout, which other tickets and people use concurrently. Do not switch branches or remove the worktree. Commit on that branch only when the request authorizes commits; never push or merge it into the project. Your ready report states the worktree path, the branch and whether changes are committed or left uncommitted, so a person can review and merge them.\n' : '')
     : 'Execution environment: dsh-superagent is waiting for setup; the management panel names what is missing.'
 }
 /**
@@ -140,7 +154,7 @@ export class Prompts {
   }
   /** A role's prompt; the main Session's Policy section follows the settings as they are now, at each model request. */
   compose(config: PromptConfig, role: Role, variables = this.environment()): string {
-    return composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
+    return composePrompt(config, role, environmentSection(config, variables, this.store.settings().executor.concurrentWrites), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
   }
   /** Returns skills to register in every Session: built-in Source skills (`feishu` only when a Feishu bot is configured) followed by team skills. */
   skills(config: PromptConfig): [string, string][] {
@@ -194,7 +208,7 @@ export class Prompts {
   }
   preview(value: unknown) {
     const config = this.validate(value)
-    const environment = environmentSection(config, this.environment()), policy = policySection(this.store.settings(), config)
+    const environment = environmentSection(config, this.environment(), this.store.settings().executor.concurrentWrites), policy = policySection(this.store.settings(), config)
     return { orchestrator: composePrompt(config, 'orchestrator', environment, policy), worker: composePrompt(config, 'worker', environment),
       parts: { orchestrator: promptParts(config, 'orchestrator', environment, policy), worker: promptParts(config, 'worker', environment) },
       skills: Object.fromEntries(this.skills(config)), scope: 'Team sections, skills, and overrides of built-in parts, which follow their built-in text until overridden. Workers additionally inherit the host prompt and repository AGENTS.md. Prompt text changes what the agents are told, not what dsh-superagent allows: tool permissions, the gate and account wrappers stay.' }

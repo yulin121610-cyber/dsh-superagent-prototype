@@ -2,8 +2,9 @@
 import { execFile } from 'node:child_process'
 import { basename } from 'node:path'
 import { promisify } from 'node:util'
+import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
-import type { Deployment } from '../deployment.ts'
+import { githubAccount, type Deployment } from '../deployment.ts'
 
 const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
@@ -12,7 +13,7 @@ const TIMEOUT_MS = 90_000
  * Source channels and pollers inspect its code to distinguish deleted conversations from retryable failures.
  */
 export class CliError extends Error {
-  constructor(message: string, readonly code?: number, readonly exitCode?: number) { super(message) }
+  constructor(message: string, readonly code?: number, readonly exitCode?: number, readonly retryAfterSeconds?: number) { super(message) }
 }
 /** Extracts a sanitized error from a failed subprocess without echoing argv, which may contain message text. */
 export function commandError(error: unknown, program = 'command'): Error {
@@ -20,11 +21,11 @@ export function commandError(error: unknown, program = 'command'): Error {
   const exitCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : undefined
   if (error && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string') {
     const stderr = error.stderr.trim()
-    let parsed: { error?: { code?: number; message?: string } } | undefined
+    let parsed: { error?: { code?: number; message?: string; retry_after_seconds?: number } } | undefined
     try { parsed = JSON.parse(stderr.slice(stderr.indexOf('{'))) as typeof parsed }
     catch { /* Non-JSON CLI diagnostics are retained below. */ }
     const code = parsed?.error?.code
-    if (parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode)
+    if (parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode, parsed.error.retry_after_seconds)
     // `gh` exits non-zero on HTTP errors (such as `gh: Not Found (HTTP 404)`) and on `gh: HTTP 304`, which ETag polling relies on.
     if (stderr) return new CliError(stderr.slice(0, 2000), Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined, exitCode)
   }
@@ -48,6 +49,9 @@ export function validItems<T>(item: z.ZodType<T>, list: readonly unknown[], tall
 }
 /** Rewrites Feishu error 232011 (bot not in chat) with remediation instructions. */
 function membership(error: unknown): unknown {
+  if (error instanceof CliError && error.code === 230027) {
+    return new CliError('Feishu bot access denied (230027). Verify bot history permissions and chat access in the app console; receiving @mentions does not grant group history access.', error.code, error.exitCode)
+  }
   if (!(error instanceof CliError) || error.code !== 232011) return error
   const hint = 'The Feishu bot is not a member of the chat. Add the bot in the chat settings, then retry.'
   return new CliError(hint, error.code, error.exitCode)
@@ -73,7 +77,7 @@ export class Commands {
     } catch (error) { throw commandError(error, program) }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(githubAccount(this.deployment).cli, args)) as T }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -82,7 +86,7 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.run(githubAccount(this.deployment).cli, ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }
@@ -101,13 +105,25 @@ export class Commands {
    * @throws CliError with Feishu's error code on failure (rewriting 232011 when the bot is not in the chat).
    */
   async lark<T>(args: string[], cwd?: string): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try { return await this.larkOnce<T>(args, cwd) }
+      catch (error) {
+        // The token endpoint rejected issuance before the requested operation ran.
+        // Never retry an uncertain send, an API-level rate limit, or a permission failure here.
+        if (!(error instanceof CliError) || error.code !== 429 || !error.message.includes('TAT endpoint rate limited') || attempt >= 2) throw error
+        const minimum = Number.isFinite(error.retryAfterSeconds) && error.retryAfterSeconds! > 0 ? error.retryAfterSeconds! * 1000 : 0
+        await delay(Math.max(minimum, 2000 * 4 ** attempt + Math.random() * 1000), undefined, { signal: this.signal })
+      }
+    }
+  }
+  private async larkOnce<T>(args: string[], cwd?: string): Promise<T> {
     const bot = this.deployment.feishu
     if (!bot) throw new Error('The Feishu Source has no working bot CLI')
     const output = await this.run(bot.cli, [...args, '--as', 'bot', '--format', 'json'], cwd)
       .catch((error: unknown) => { throw membership(error) })
-    const result = JSON.parse(output) as { ok: boolean; data: T; error?: { code?: number; message?: string } }
+    const result = JSON.parse(output) as { ok: boolean; data: T; error?: { code?: number; message?: string; retry_after_seconds?: number } }
     const code = result.error?.code
-    if (!result.ok) throw membership(new CliError(`${result.error?.message ?? 'Feishu command failed'}${code ? ` (${code})` : ''}`, code))
+    if (!result.ok) throw membership(new CliError(`${result.error?.message ?? 'Feishu command failed'}${code ? ` (${code})` : ''}`, code, undefined, result.error?.retry_after_seconds))
     return result.data
   }
   /** Runs `git` on PATH using the agent's isolated git environment and credential helper. */

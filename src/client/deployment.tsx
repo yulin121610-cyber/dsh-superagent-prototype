@@ -62,11 +62,12 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
         <p className="dt-error" role="status"><SetupMessage problem={setup.problem} lead /></p><CheckSetupButton />
       </div>}
       {showAccounts && <Section title={t('deploymentDerived')} hint={t('deploymentDerivedHint')}>
-        <KeyValues rows={[[t('deploymentRepository'), accounts?.repository ?? '—'],
-          [t('deploymentAgent'), accounts ? `@${accounts.agent}` : '—'], [t('deploymentFeishu'), feishu]]} />
+        <KeyValues rows={[[t('deploymentRepository'), setup.machine.localWorkspace || accounts?.repository || '—'],
+          [t('deploymentAgent'), accounts?.agent ? `@${accounts.agent}` : '—'], [t('deploymentFeishu'), feishu]]} />
         <Hint>{t('deploymentAccountsWhere')}</Hint>
       </Section>}
       <Section title={t('deploymentMachine')}>
+        {setup.machine.localWorkspace && <Field label={t('deploymentLocalWorkspace')}><span className="dt-mono">{setup.machine.localWorkspace}</span></Field>}
         {readOnlyHint && <Hint>{readOnlyHint}</Hint>}
         <div className="dt-field">
           <span className="dt-field-head">{t('deploymentStateDir')}<InfoTip text={t('deploymentStateDirHint')} /></span>

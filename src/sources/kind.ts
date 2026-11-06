@@ -104,6 +104,8 @@ export interface SourceKind<C extends Record<string, unknown> = Record<string, u
   find?(query: string): { threads: string[]; terms: string[] }
   /** Returns the ID of the Trigger whose message this Trigger replies to, when derivable without a network read. */
   repliesTo?(trigger: Trigger): string | undefined
+  /** Root message of a reply topic; may differ from the direct parent quoted in that topic. */
+  replyRoot?(trigger: Trigger): string | undefined
   /** Policy section for kinds whose senders have their own identity. */
   policy?: SourcePolicyPart<Record<string, unknown> & { allowed: { id: string; name?: string }[] }>
   /** Rereads display names for row keys (such as chat names), stores the resolved names in `KV.sources.labels(kind)`, and returns them. */

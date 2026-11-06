@@ -60,6 +60,9 @@ importers:
       '@deepseek-ai/dsh-permission-presets':
         specifier: 0.2.1-alpha.2
         version: 0.2.1-alpha.2(f6be8f3940a5b4abbf1092bac012a3f9)
+      '@deepseek-ai/dsh-sandbox-policy':
+        specifier: 0.2.1-alpha.2
+        version: 0.2.1-alpha.2(0fd322bfe953601041c24979625458eb)
       '@deepseek-ai/dsh-scope':
         specifier: 0.2.1-alpha.2
         version: 0.2.1-alpha.2(@deepseek-ai/cordis@4.0.5-alpha.1)

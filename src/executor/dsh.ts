@@ -2,9 +2,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { existsSync } from 'node:fs'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
-import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
+import { dirname, join, sep } from 'node:path'
+import { isolatedExecution, key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
@@ -15,6 +16,8 @@ import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
+import { boundProjectPath, existingProjectPath } from './project-routing.ts'
+import { ensureWorktree, planWorktree, removeCleanWorktree } from './worktrees.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
@@ -67,7 +70,7 @@ export interface ExecutorHost {
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
   /** The `worker` health entry, which reports whether background worker event handling failed. */
   readonly health: HealthEntry
-  readonly machine: Pick<Machine, 'stateDir'>
+  readonly machine: Pick<Machine, 'stateDir' | 'localWorkspace'>
   readonly lifetime: AbortSignal
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
   readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
@@ -95,7 +98,7 @@ export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string 
 }
 /** Builds a newly accepted ticket's Execution metadata: its worktree name, workspace directory, and assignment text. */
 export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, settings: Settings,
-  stateDir: string): Execution {
+  stateDir: string, localWorkspace?: string): Execution {
   const name = ticketWorktreeName(outcome.name ?? '', ticket.id)
   const source = ticket.origin.triggerId
   const note = outcome.note ? `\nRouting note (not the source request): ${outcome.note}` : ''
@@ -107,7 +110,7 @@ export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutco
   const assignment = ticket.mandate.strength === 'inferred' && ruleIds
     ? `Proactively accepted under ${ruleIds.join(', ')}. Scope: ${outcome.scope}.${precedence}${note}`
     : note.trim()
-  return { name, directory: join(executionRoot(settings, stateDir), name), assignment }
+  return { name, directory: localWorkspace || join(executionRoot(settings, stateDir), name), assignment }
 }
 /** Character limits for inline assignment and trigger text in worker messages; longer text is read via its resource. */
 const ASSIGNMENT_CHARS = 1500, TRIGGER_CHARS = 600
@@ -166,7 +169,8 @@ export function inputMessage(input: TicketInput, trigger?: object): string | und
  * Tracks active and starting worker sessions against the configured concurrency limit: a ticket holds a slot while its
  * worker's turn runs, while its shell jobs or subagents run after that turn ended, and while a launch or wake starts that worker.
  * DshExecutor reserves slots synchronously before awaiting launch or wake work so two starts cannot take the last slot,
- * and allows one extra slot beyond the limit for human follow-ups (`by === 'person'`) so they never wait behind new launches.
+ * and optionally allows one extra slot for human follow-ups. Local workers also lock their project, without overflow; a write
+ * ticket isolated in its own git worktree (`isolated`) takes no project lock and only counts against the total limit.
  */
 export class WorkerSlots {
   /** Tickets currently holding a startup slot, mapped to whether the start is a launch, a wake, or a wake for a person's message. */
@@ -175,7 +179,10 @@ export class WorkerSlots {
    * @param running - Returns the ticket IDs whose worker holds a slot (see `DshExecutor.running`).
    * @param max - Returns the configured maximum number of concurrent worker slots.
    */
-  constructor(private readonly running: () => string[], private readonly max: () => number) {}
+  constructor(private readonly running: () => string[], private readonly max: () => number, private readonly humanOverflow = true,
+    private readonly project?: (ticketId: string) => string | undefined,
+    private readonly readOnly: (ticketId: string) => boolean = () => false,
+    private readonly isolated: (ticketId: string) => boolean = () => false) {}
   /** Number of slots currently in use across running workers and starting reservations. */
   used(): number { return new Set([...this.running(), ...this.starting.keys()]).size }
   /** How many launches may run concurrently: the slots not held by a running worker or a wake reservation. */
@@ -191,7 +198,19 @@ export class WorkerSlots {
    */
   reserve(ticketId: string, by: 'launch' | 'wake' | 'person'): void {
     if (this.starting.has(ticketId)) return
-    if (this.used() >= this.max() + (by === 'person' ? 1 : 0)) throw new Later('No worker slot is free')
+    if (this.project) {
+      const project = this.project(ticketId)
+      // A worker in its own worktree writes outside every project checkout, so it neither waits for nor blocks a project.
+      const isolated = this.isolated(ticketId)
+      for (const other of new Set([...this.running(), ...this.starting.keys()])) {
+        if (other === ticketId || isolated || this.isolated(other) || (this.readOnly(ticketId) && this.readOnly(other))) continue
+        const held = this.project(other)
+        // An unbound/legacy ticket can access the whole shared workspace; overlapping roots also share a lock.
+        const contains = (parent: string, child: string) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep)
+        if (!project || !held || contains(project, held) || contains(held, project)) throw new Later('Project workspace is busy')
+      }
+    }
+    if (this.used() >= this.max() + (by === 'person' && this.humanOverflow ? 1 : 0)) throw new Later('No worker slot is free')
     this.starting.set(ticketId, by)
   }
   /** Releases `ticketId`'s starting slot once its worker session is running or the launch/wake attempt has ended. */
@@ -226,8 +245,14 @@ export class DshExecutor implements Executor {
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
   /** Registers the `launch` and `delivery` effect handlers; both are held (concurrency limit 0) while processing is paused. */
   constructor(private readonly host: ExecutorHost) {
-    this.slots = new WorkerSlots(() => host.store.tickets.open().filter(ticket => this.running(ticket)).map(ticket => ticket.id),
-      () => host.store.settings().executor.maxWorkers)
+    this.slots = new WorkerSlots(() => [...new Set([
+      ...host.store.tickets.open().filter(ticket => this.running(ticket)).map(ticket => ticket.id),
+      ...host.machine.localWorkspace ? this.stopping.keys() : [],
+    ])],
+      () => host.store.settings().executor.maxWorkers, !host.machine.localWorkspace,
+      host.machine.localWorkspace ? ticketId => host.store.tickets.get(ticketId)?.execution?.projectPath : undefined,
+      ticketId => host.store.tickets.get(ticketId)?.execution?.access === 'read-only',
+      ticketId => !!host.machine.localWorkspace && isolatedExecution(host.store.tickets.get(ticketId)?.execution))
     // Each launch reserves a worker slot so launches run concurrently while slots are free.
     host.effects.handle('launch', payload => this.launchQueued(payload), { limit: () => host.paused() ? 0 : this.slots.launches(),
       retry: [5000, 300_000] })
@@ -236,7 +261,67 @@ export class DshExecutor implements Executor {
   }
   /** Populates a newly accepted ticket's `execution` attributes (worktree name, workspace directory, and assignment text). */
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
-    return { ...ticket, execution: ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir) }
+    const settings = this.host.store.settings()
+    const projectPath = boundProjectPath(settings, sourceTrigger(this.host, ticket), this.host.machine.localWorkspace)
+    const execution = ticketExecution(ticket, outcome, settings, this.host.machine.stateDir, projectPath ?? this.host.machine.localWorkspace)
+    const readOnly = outcome.access === 'read-only'
+    // With concurrent writes on, a local write ticket on a bound git project runs in its own worktree outside the project; any other keeps the project lock.
+    // Frozen at acceptance: turning the setting off later leaves tickets that have a worktree in it.
+    const planned = this.host.machine.localWorkspace && projectPath && !readOnly && settings.executor.concurrentWrites
+      // Under the state directory, never the executor directory setting, which local installations may point into a project.
+      ? planWorktree(join(this.host.machine.stateDir, 'local-worktrees'), projectPath, ticket.id, execution.name) : undefined
+    return { ...ticket, execution: { ...execution, ...projectPath ? { projectPath } : {}, ...readOnly ? { access: 'read-only' } : {},
+      ...planned ? { directory: planned.directory, worktree: planned.worktree } : {} } }
+  }
+  /**
+   * Creates or reuses an isolated ticket's worktree. When it cannot, and `fallBack` holds, the ticket moves to its project
+   * directory under the exclusive project lock (recorded in `worktree.error`) and its launch waits for that lock (`Later`);
+   * it never writes to the project directory without the lock.
+   * @throws PrepareFailed when the bound project itself is unavailable.
+   */
+  private async prepareWorktree(ticket: Ticket, fallBack: boolean): Promise<void> {
+    const execution = ticket.execution!, worktree = execution.worktree!, projectPath = execution.projectPath!
+    try { if (existingProjectPath(projectPath) !== projectPath) throw new Error('Workspace changed') }
+    catch { throw new PrepareFailed('Local workspace changed or is unavailable; do not create a replacement directory.') }
+    try {
+      const { base } = await ensureWorktree(worktree, execution.directory)
+      this.updateWorktree(ticket.id, current => ({ ...current, ...base ? { base } : {}, removedAt: undefined }))
+    } catch (error) {
+      if (!fallBack || this.host.closing()) throw error
+      const reason = error instanceof Error ? error.message : String(error)
+      this.host.store.atomic(() => {
+        const stored = this.host.store.tickets.get(ticket.id)
+        if (!stored?.execution?.worktree) return
+        this.host.store.tickets.save({ ...stored, execution: { ...stored.execution, directory: projectPath, worktree: { ...stored.execution.worktree, error: reason } } })
+      })
+      throw new Later(`The worktree could not be created, so the ticket waits for exclusive project access: ${reason}`)
+    }
+  }
+  /** Rewrites a ticket's stored worktree record. */
+  private updateWorktree(ticketId: string, change: (worktree: NonNullable<Execution['worktree']>) => NonNullable<Execution['worktree']>): void {
+    this.host.store.atomic(() => {
+      const stored = this.host.store.tickets.get(ticketId)
+      if (!stored?.execution?.worktree) return
+      this.host.store.tickets.save({ ...stored, execution: { ...stored.execution, worktree: change(stored.execution.worktree) } })
+    })
+  }
+  /**
+   * After an ended ticket's worker stopped, removes its worktree and branch only when they hold no uncommitted change and no
+   * commit outside the project's HEAD; anything else stays for a person to review and merge. A resume recreates it.
+   */
+  private cleanUp(ticketId: string): void {
+    const worktree = this.host.store.tickets.get(ticketId)?.execution?.worktree
+    if (!this.host.machine.localWorkspace || !worktree || worktree.error || worktree.removedAt) return
+    const ended = () => !!this.host.store.tickets.get(ticketId)?.ended
+    if (!ended()) return
+    void (async () => {
+      await this.stopped(ticketId)
+      const agent = this.host.context.agents.get(workerSessionId(ticketId) as SessionId)
+      if (agent) await until(agent.whenIdle(), this.host.lifetime, SHUTDOWN_STOP_MS)
+      if (this.host.closing()) return
+      const result = await removeCleanWorktree(worktree, () => !ended())
+      if (result.removed) this.updateWorktree(ticketId, current => ({ ...current, removedAt: now() }))
+    })().catch(() => { /* A worktree that could not be removed stays, which loses nothing. */ })
   }
   /**
    * Runs the configured `executor.prepare` command for a new ticket workspace in its parent directory with the ticket's
@@ -246,6 +331,15 @@ export class DshExecutor implements Executor {
    */
   private async prepareDirectory(ticket: Ticket): Promise<void> {
     const directory = ticket.execution?.directory ?? ''
+    const projectPath = ticket.execution?.projectPath
+    if (projectPath || this.host.machine.localWorkspace) {
+      if (projectPath && this.host.machine.localWorkspace && isolatedExecution(ticket.execution)) { await this.prepareWorktree(ticket, true); return }
+      try {
+        const expected = projectPath ?? this.host.machine.localWorkspace
+        if (directory !== expected || !(await stat(directory)).isDirectory() || (projectPath && existingProjectPath(projectPath) !== projectPath)) throw new Error('Workspace changed')
+      } catch { throw new PrepareFailed('Local workspace changed or is unavailable; do not create a replacement directory.') }
+      return
+    }
     await mkdir(dirname(directory), { recursive: true })
     const command = this.host.store.settings().executor.prepare.trim()
     const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
@@ -310,6 +404,11 @@ export class DshExecutor implements Executor {
         }
         const input = ticket.inputs.find(item => item.id === inputId)
         try {
+          // Recreate an isolated worker's worktree if it was removed meanwhile, never falling back to the project directory
+          // its Session already works in.
+          if (this.host.machine.localWorkspace && isolatedExecution(ticket.execution) && !existsSync(ticket.execution!.directory)) {
+            await this.prepareWorktree(ticket, false)
+          }
           // Recreate the worker session if it was externally deleted.
           if (!this.host.context.agents.get(sessionId as SessionId)) {
             await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
@@ -366,6 +465,7 @@ export class DshExecutor implements Executor {
       // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
       this.stopWork(ticket.id, reason)
       this.left.get(ticket.id)?.collect.abort(); this.left.delete(ticket.id); this.personal.delete(ticket.id)
+      this.cleanUp(ticket.id)
     })
   }
   /** Stop what a ticket's worker runs in the background (see `stopBackground`). */

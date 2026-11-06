@@ -27,6 +27,9 @@ export function ticketCard(ticket: Ticket) {
   const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
+    ...ticket.execution?.access === 'read-only' ? { access: 'read-only' as const } : {},
+    ...ticket.execution?.worktree && !ticket.execution.worktree.error ? { worktree: { path: ticket.execution.worktree.path, branch: ticket.execution.worktree.branch,
+      ...ticket.execution.worktree.removedAt ? { removed: true } : {} } } : {},
     ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
     preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }

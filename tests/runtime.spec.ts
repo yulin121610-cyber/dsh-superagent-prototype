@@ -1,6 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { bindScopeParent } from '@deepseek-ai/dsh-scope'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
@@ -18,7 +19,7 @@ import { SCHEMA_VERSION, Store } from '../src/app/store.ts'
 import { TextCache } from '../src/app/cache.ts'
 import { KV } from '../src/kv.ts'
 import { SettingsSchema, policyVersion, type SettingsOrigin } from '../src/policy.ts'
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { readFileSync, readdirSync, writeFileSync, realpathSync } from 'node:fs'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { githubKind, pollRound } from '../src/sources/github.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
@@ -126,11 +127,11 @@ async function route(item: Record<string, unknown>): Promise<Record<string, unkn
   if (results[0]!.refused) throw new Error(String(results[0]!.refused))
   return results[0]!
 }
-async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归')) {
+async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归'), access?: 'read-only' | 'write') {
   await receive(trigger)
   expect(relays(runtime.masterId).some(item => item.trigger_id === trigger.id)).toBe(true)
   const result = await route({ kind: 'accept', trigger_id: trigger.id, title: '修复回归',
-    worktree_name: worktreeName, acknowledgement: '收到，修复回归。' })
+    worktree_name: worktreeName, acknowledgement: '收到，修复回归。', ...access ? { access } : {} })
   const ticket = runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
   return { trigger, ticket, sessionId: `worker-${ticket.id}` }
 }
@@ -204,6 +205,9 @@ beforeEach(async () => {
   }
   jobs = jobRegistry()
   services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }, jobs: jobs.service }
+  services.sandboxPolicy = { resolve: ({ session }: { session: { snapshotEvents(): { type: string; data: { mode?: string } }[] } }) => ({
+    mode: session.snapshotEvents().filter(event => event.type === 'sandbox/mode').at(-1)?.data.mode ?? 'danger-full-access',
+  }) }
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT(), OTHER(), BOT()]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()
@@ -215,6 +219,32 @@ beforeEach(async () => {
   deliveries.mockClear()
 })
 afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
+
+it('routes a Feishu request to an existing local workspace and completes it without GitHub or preparation', async () => {
+  const workspace = join(directory, 'existing-workspace')
+  mkdirSync(workspace)
+  const marker = join(workspace, 'existing-user-work.txt')
+  writeFileSync(marker, 'uncommitted work\n')
+  subprocess.spawn.mockClear()
+  await restart({ localWorkspace: workspace }, { github: { repository: '', cli: '' } })
+  await runtime.ready
+  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  expect(runtime.configured()).toBe(true)
+  expect(runtime.setupProblem).toBeUndefined()
+  expect(runtime.deployment.github).toBeUndefined()
+  const startup = subprocess.spawn.mock.calls.flatMap(([spec]) => [spec.argv.join(' ')])
+  expect(startup.some(command => command.includes('api repos/') || command.includes('api user'))).toBe(false)
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, prepare: 'must-not-run' } })
+  subprocess.spawn.mockClear()
+  const { ticket, sessionId } = await acceptedTicket(feishu('local', '@bot 分析本地工作区，不修改代码'))
+  expect(ticket.execution?.directory).toBe(workspace)
+  expect(readFileSync(marker, 'utf8')).toBe('uncommitted work\n')
+  expect(subprocess.spawn.mock.calls.some(([spec]) => spec.argv.includes('must-not-run'))).toBe(false)
+  expect(sections.get(sessionId)!.text({})).toContain('## Local workspace mode')
+  expect(sections.get(sessionId)!.text({})).toContain(workspace)
+  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: '已完成本地分析。' })
+  expect(runtime.store.tickets.get(ticket.id)!.ended?.outcome).toBe('completed')
+})
 
 it('relays an explicit member mention as a candidate and creates the ticket, acknowledgement, subscription and worker on accept', async () => {
   const { trigger, ticket, sessionId } = await acceptedTicket()
@@ -1793,4 +1823,371 @@ it('keeps the Policy the main Session judges by in its prompt, after admission a
   await runtime.settings.save('policy', { ...saved.policy, rules: rules.map(rule => ({ ...rule, enabled: false })) }, runtime.store.blockRevision('policy'), 'panel')
   expect(policy()).toContain('No rule is enabled: a proactive candidate can only be ignored.')
   expect(policy()).toContain('The accept mode and the rules decide proactive candidates only')
+})
+
+
+it('binds each group to its project at acceptance and keeps resumed tickets in that project after a mapping change', async () => {
+  const workspace = join(directory, 'all-projects'), ebfs = join(directory, 'ebfs'), otc = join(directory, 'otc'), replacement = join(directory, 'replacement')
+  for (const path of [workspace, ebfs, otc, replacement]) mkdirSync(path)
+  await restart({ localWorkspace: workspace }, { github: { repository: '', cli: '' } })
+  await runtime.ready
+  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  const config = runtime.sources.instance('feishu')!.config
+  const configure = (project: string) => runtime.settings.save('source:feishu', { enabled: true, config: { ...config, chats: [
+    { chatId: CHAT, listen: 'mentions', projectPath: project }, { chatId: 'oc_otc', listen: 'mentions', projectPath: otc },
+  ] } }, runtime.store.blockRevision('source:feishu'), 'panel')
+  await configure(ebfs)
+  const first = await acceptedTicket(feishu('route1', '@bot 帮我分析这个问题'))
+  const ebfsPath = realpathSync(ebfs)
+  expect(first.ticket.execution).toMatchObject({ directory: ebfsPath, projectPath: ebfsPath })
+  expect(controller.create).toHaveBeenCalledWith(expect.objectContaining({ sessionId: first.sessionId, workspaceId: ebfsPath }))
+  expect(Object.fromEntries(runtime.ticketEnvironment(first.ticket).map(v => [v.key, v.value]))).toMatchObject({
+    DSH_SUPERAGENT_DIR: ebfsPath, DSH_SUPERAGENT_LOCAL_WORKSPACE: ebfsPath, DSH_SUPERAGENT_PROJECT: ebfsPath,
+  })
+  expect(sections.get(first.sessionId)!.text({})).toContain('bound to DSH_SUPERAGENT_PROJECT')
+  await runTool(first.sessionId, 'orchestrator_report', { state: 'ready', summary: '已完成。' })
+  await configure(replacement)
+  await receive(feishu('route2', '@bot 继续检查同一问题', { root_id: 'om_route1' }))
+  const resumed = runtime.store.tickets.get(first.ticket.id)!
+  expect(resumed.ended).toBeUndefined()
+  expect(resumed.execution).toMatchObject({ directory: ebfsPath, projectPath: ebfsPath })
+  expect(Object.fromEntries(runtime.ticketEnvironment(resumed).map(v => [v.key, v.value])).DSH_SUPERAGENT_LOCAL_WORKSPACE).toBe(ebfsPath)
+  await runTool(first.sessionId, 'orchestrator_report', { state: 'ready', summary: '检查完成。' })
+  const second = await acceptedTicket(feishu('route3', '@bot 帮我分析这个问题', { chat_id: 'oc_otc' }))
+  const otcPath = realpathSync(otc)
+  expect(second.ticket.execution).toMatchObject({ directory: otcPath, projectPath: otcPath })
+  expect(controller.create).toHaveBeenCalledWith(expect.objectContaining({ sessionId: second.sessionId, workspaceId: otcPath }))
+  expect(Object.fromEntries(runtime.ticketEnvironment(second.ticket).map(v => [v.key, v.value]))).toMatchObject({
+    DSH_SUPERAGENT_DIR: otcPath, DSH_SUPERAGENT_LOCAL_WORKSPACE: otcPath, DSH_SUPERAGENT_PROJECT: otcPath,
+  })
+})
+
+it('runs independent local projects past a busy project in the queue and releases its lock when its turn finishes', async () => {
+  const workspace = join(directory, 'all-projects'), ebfs = join(directory, 'ebfs'), otc = join(directory, 'otc')
+  for (const path of [workspace, ebfs, otc]) mkdirSync(path)
+  await restart({ localWorkspace: workspace }, { github: { repository: '', cli: '' } })
+  await runtime.ready
+  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  const config = runtime.sources.instance('feishu')!.config
+  await runtime.settings.save('source:feishu', { enabled: true, config: { ...config, chats: [
+    { chatId: CHAT, listen: 'mentions', projectPath: ebfs }, { chatId: 'oc_otc', listen: 'mentions', projectPath: otc },
+  ] } }, runtime.store.blockRevision('source:feishu'), 'panel')
+  const first = await acceptedTicket(feishu('parallel1', '@bot 分析一'))
+  const blocked = await acceptedTicket(feishu('parallel2', '@bot 分析二'))
+  const independent = await acceptedTicket(feishu('parallel3', '@bot 分析三', { chat_id: 'oc_otc' }))
+  expect(runtime.store.tickets.get(first.ticket.id)!.assignments.at(-1)!.state).toBe('running')
+  expect(runtime.store.tickets.get(blocked.ticket.id)!.assignments.at(-1)!.state).toBe('pending')
+  expect(runtime.store.tickets.get(independent.ticket.id)!.assignments.at(-1)!.state).toBe('running')
+  expect(runtime.executor.activeCount()).toBe(2)
+  const queued = runtime.store.db.prepare('SELECT attempts, error FROM effect WHERE kind = ? AND key = ?').get('launch', blocked.ticket.assignments.at(-1)!.id)
+  expect(queued).toMatchObject({ attempts: 0, error: '' })
+  const job = jobs.run(first.sessionId)
+  jobs.service.kill.mockImplementationOnce(() => 'requested') // The killed process has not exited yet.
+  await runTool(first.sessionId, 'orchestrator_report', { state: 'ready', summary: '已完成。' })
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+  try {
+    await runtime.pump(); await runtime.idle()
+    expect(runtime.store.tickets.get(blocked.ticket.id)!.assignments.at(-1)!.state).toBe('pending')
+    jobs.end(job, 'killed')
+    await new Promise(resolve => setImmediate(resolve))
+    vi.setSystemTime(Date.now() + 6000)
+    await runtime.pump(); await runtime.idle()
+  } finally { vi.useRealTimers() }
+  expect(runtime.store.tickets.get(blocked.ticket.id)!.assignments.at(-1)!.state).toBe('running')
+})
+
+it('shares a local project between read-only tickets, holds writers, and keeps workers and descendants confined', async () => {
+  const workspace = join(directory, 'project'); mkdirSync(workspace)
+  await restart({ localWorkspace: workspace }, { github: { repository: '', cli: '' } })
+  await runtime.ready
+  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  const one = await acceptedTicket(feishu('reader1', '@bot 只读排查问题一'), 'read-only')
+  const two = await acceptedTicket(feishu('reader2', '@bot 只读排查问题二'), 'read-only')
+  const writer = await acceptedTicket(feishu('writer3', '@bot 修改代码'), 'write')
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  expect([state(one.ticket.id), state(two.ticket.id), state(writer.ticket.id)]).toEqual(['running', 'running', 'pending'])
+  expect(runtime.executor.activeCount()).toBe(2)
+  expect(one.ticket.execution?.access).toBe('read-only')
+  expect(sections.get(one.sessionId)!.text({})).toContain('This is a read-only investigation ticket')
+  const worker = agents.get(one.sessionId)! as unknown as { session: { append(type: string, data: unknown): void; snapshotEvents(): { type: string; data: { mode?: string } }[] } }
+  const mode = () => worker.session.snapshotEvents().filter(event => event.type === 'sandbox/mode').at(-1)?.data.mode
+  expect(mode()).toBe('read-only')
+  expect(guards.get(one.sessionId)!({ name: 'edit', arguments: {} })).toMatch(/^Read-only ticket cannot modify/)
+  expect(guards.get(one.sessionId)!({ name: 'write', arguments: {} })).toMatch(/^Read-only ticket cannot modify/)
+  expect(guards.get(one.sessionId)!({ name: 'bash', arguments: { command: 'git status', sandbox_permissions: 'use_default' } })).toBeUndefined()
+  expect(guards.get(one.sessionId)!({ name: 'bash', arguments: { sandbox_permissions: 'require_escalated' } })).toMatch(/cannot escalate/)
+  worker.session.append('sandbox/mode', { mode: 'danger-full-access' })
+  expect(guards.get(one.sessionId)!({ name: 'read', arguments: {} })).toBeUndefined()
+  expect(mode()).toBe('read-only')
+  await (controller.create as (options: { sessionId: string }) => Promise<void>)({ sessionId: 'reader-child' })
+  const child = agents.get('reader-child')! as unknown as { session: { header: { parentSession: string }; snapshotEvents(): { type: string; data: { mode?: string } }[] } }
+  child.session.header.parentSession = one.sessionId
+  await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
+  expect(child.session.snapshotEvents().filter(event => event.type === 'sandbox/mode').at(-1)?.data.mode).toBe('read-only')
+  expect(guards.get('reader-child')!({ name: 'edit', arguments: {} })).toMatch(/^Read-only ticket cannot modify/)
+  await runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: '排查完成。' })
+  expect(state(writer.ticket.id)).toBe('pending')
+  await runTool(two.sessionId, 'orchestrator_report', { state: 'ready', summary: '排查完成。' })
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+  try { await runtime.pump(); await runtime.idle() } finally { vi.useRealTimers() }
+  expect(state(writer.ticket.id)).toBe('running')
+  const later = await acceptedTicket(feishu('reader4', '@bot 再只读检查'), 'read-only')
+  expect(state(later.ticket.id)).toBe('pending')
+  await runTool(writer.sessionId, 'orchestrator_report', { state: 'ready', summary: '修改完成。' })
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+  try { await runtime.pump(); await runtime.idle() } finally { vi.useRealTimers() }
+  expect(state(later.ticket.id)).toBe('running')
+  await runTool(later.sessionId, 'orchestrator_report', { state: 'ready', summary: '排查完成。' })
+  await receive(feishu('reader5', '@bot 继续检查，不修改', { root_id: 'om_reader4' }))
+  expect(runtime.store.tickets.get(later.ticket.id)!.execution?.access).toBe('read-only')
+})
+
+/** A git repository with one commit at `path`, as a bound project. */
+function gitProject(path: string): string {
+  const env = { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.test', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.test' }
+  mkdirSync(path, { recursive: true })
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: path, env })
+  writeFileSync(join(path, 'README.md'), 'base\n')
+  execFileSync('git', ['add', '.'], { cwd: path, env }); execFileSync('git', ['commit', '-q', '-m', 'base'], { cwd: path, env })
+  return realpathSync(path)
+}
+async function bindProject(project: string, concurrentWrites = true): Promise<void> {
+  await restart({ localWorkspace: join(directory, 'all-projects') }, { github: { repository: '', cli: '' } })
+  await runtime.ready
+  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  setConcurrentWrites(concurrentWrites)
+  const config = runtime.sources.instance('feishu')!.config
+  await runtime.settings.save('source:feishu', { enabled: true, config: { ...config, chats: [{ chatId: CHAT, listen: 'mentions', projectPath: project }] } }, runtime.store.blockRevision('source:feishu'), 'panel')
+}
+function setConcurrentWrites(on: boolean): void {
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, concurrentWrites: on } })
+}
+const gitOut = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined } }).toString().trim()
+
+it('runs write tickets on one git project concurrently in their own worktrees beside readers, and reports where to merge', async () => {
+  mkdirSync(join(directory, 'all-projects'))
+  const project = gitProject(join(directory, 'all-projects', 'service'))
+  await bindProject(project)
+  const one = await acceptedTicket(feishu('wt1', '@bot 修改一'), 'write')
+  const two = await acceptedTicket(feishu('wt2', '@bot 修改二'))
+  const reader = await acceptedTicket(feishu('wt3', '@bot 只读排查'), 'read-only')
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  expect([state(one.ticket.id), state(two.ticket.id), state(reader.ticket.id)]).toEqual(['running', 'running', 'running'])
+  expect(runtime.executor.activeCount()).toBe(3)
+  const first = runtime.store.tickets.get(one.ticket.id)!.execution!, second = runtime.store.tickets.get(two.ticket.id)!.execution!
+  expect(first.worktree).toMatchObject({ branch: `superagent/${one.ticket.id}`, repository: project, base: gitOut(project, 'rev-parse', 'HEAD') })
+  expect(first.directory).toBe(first.worktree!.path)
+  expect(first.directory.startsWith(project)).toBe(false)
+  expect(first.directory.startsWith(join(directory, 'local-worktrees') + '/')).toBe(true)
+  expect(second.directory).not.toBe(first.directory)
+  expect(gitOut(first.directory, 'branch', '--show-current')).toBe(`superagent/${one.ticket.id}`)
+  expect(gitOut(second.directory, 'branch', '--show-current')).toBe(`superagent/${two.ticket.id}`)
+  expect(gitOut(project, 'branch', '--show-current')).toBe('main')
+  expect(runtime.store.tickets.get(reader.ticket.id)!.execution).toMatchObject({ directory: project, access: 'read-only' })
+  expect(runtime.store.tickets.get(reader.ticket.id)!.execution!.worktree).toBeUndefined()
+  expect(controller.create).toHaveBeenCalledWith(expect.objectContaining({ sessionId: one.sessionId, workspaceId: first.directory }))
+  expect(Object.fromEntries(runtime.ticketEnvironment(runtime.store.tickets.get(one.ticket.id)!).map(v => [v.key, v.value]))).toMatchObject({
+    DSH_SUPERAGENT_DIR: first.directory, DSH_SUPERAGENT_PROJECT: project, DSH_SUPERAGENT_WORKTREE: first.worktree!.path, DSH_SUPERAGENT_BRANCH: first.worktree!.branch })
+  expect(sections.get(one.sessionId)!.text({})).toContain('runs in its own git worktree DSH_SUPERAGENT_WORKTREE')
+  expect(sections.get(reader.sessionId)!.text({})).not.toContain('runs in its own git worktree DSH_SUPERAGENT_WORKTREE')
+  // One worker leaves uncommitted work, which stays; the other changed nothing, and its worktree and branch go once it ended.
+  writeFileSync(join(first.directory, 'README.md'), 'changed\n')
+  await runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: '已修改，未提交。' })
+  await runTool(two.sessionId, 'orchestrator_report', { state: 'ready', summary: '无需修改。' })
+  const report = relays(runtime.masterId).filter(item => item.kind === 'worker_report' && (item.ticket as { ticket_id: string }).ticket_id === one.ticket.id).at(-1)!
+  expect(report.ticket).toMatchObject({ worktree: { path: first.worktree!.path, branch: first.worktree!.branch } })
+  await vi.waitFor(() => { expect(runtime.store.tickets.get(two.ticket.id)!.execution!.worktree!.removedAt).toBeDefined() })
+  expect(existsSync(second.worktree!.path)).toBe(false)
+  expect(gitOut(project, 'branch', '--list', second.worktree!.branch)).toBe('')
+  await new Promise(resolve => setTimeout(resolve, 50))
+  expect(runtime.store.tickets.get(one.ticket.id)!.execution!.worktree!.removedAt).toBeUndefined()
+  expect(readFileSync(join(first.directory, 'README.md'), 'utf8')).toBe('changed\n')
+  expect(readFileSync(join(project, 'README.md'), 'utf8')).toBe('base\n')
+  // A follow-up resumes the ticket in the same worktree, with its work; the removed one comes back on its branch.
+  await receive(feishu('wt4', '@bot 继续修改', { root_id: 'om_wt1' }))
+  const resumed = runtime.store.tickets.get(one.ticket.id)!
+  expect(resumed.ended).toBeUndefined()
+  expect(state(one.ticket.id)).toBe('running')
+  expect(resumed.execution).toMatchObject({ directory: first.directory, worktree: { path: first.worktree!.path, branch: first.worktree!.branch } })
+  expect(readFileSync(join(first.directory, 'README.md'), 'utf8')).toBe('changed\n')
+  await receive(feishu('wt5', '@bot 再看一下', { root_id: 'om_wt2' }))
+  await vi.waitFor(() => { expect(state(two.ticket.id)).toBe('running') })
+  expect(runtime.store.tickets.get(two.ticket.id)!.execution!.worktree!.removedAt).toBeUndefined()
+  expect(gitOut(second.directory, 'branch', '--show-current')).toBe(second.worktree!.branch)
+  // A host restart relaunches the interrupted tickets in the worktrees they had.
+  controller.create.mockClear()
+  await restart({ localWorkspace: join(directory, 'all-projects') }, { github: { repository: '', cli: '' } })
+  await runtime.ready
+  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  await runtime.pump(); await runtime.idle()
+  expect(runtime.store.tickets.get(one.ticket.id)!.execution).toMatchObject({ directory: first.directory, worktree: { path: first.worktree!.path } })
+  expect(readFileSync(join(first.directory, 'README.md'), 'utf8')).toBe('changed\n')
+  expect(gitOut(project, 'worktree', 'list').split('\n')).toHaveLength(3)
+})
+
+it('keeps the original exclusive flow on a git project while concurrent writes are off, the default', async () => {
+  mkdirSync(join(directory, 'all-projects'))
+  const project = gitProject(join(directory, 'all-projects', 'service'))
+  await bindProject(project, false)
+  expect(runtime.store.settings().executor.concurrentWrites).toBe(false)
+  const one = await acceptedTicket(feishu('off1', '@bot 修改一'))
+  const two = await acceptedTicket(feishu('off2', '@bot 修改二'), 'write')
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  expect([state(one.ticket.id), state(two.ticket.id)]).toEqual(['running', 'pending'])
+  expect(one.ticket.execution).toEqual(expect.objectContaining({ directory: project, projectPath: project }))
+  expect(one.ticket.execution!.worktree).toBeUndefined()
+  expect(gitOut(project, 'worktree', 'list').split('\n')).toHaveLength(1)
+  expect(gitOut(project, 'branch', '--list', 'superagent/*')).toBe('')
+  const variables = runtime.ticketEnvironment(runtime.store.tickets.get(one.ticket.id)!)
+  expect(variables.map(v => v.key)).not.toContain('DSH_SUPERAGENT_WORKTREE')
+  expect(variables.find(v => v.key === 'DSH_SUPERAGENT_LOCAL_WORKSPACE')!.description.en).toBe('Existing local workspace; follow its project instructions and use its repositories without creating clones or worktrees')
+  for (const session of [one.sessionId, runtime.masterId]) {
+    const text = sections.get(session)!.text({})
+    expect(text).toContain('a write ticket needs exclusive project access; different projects may run concurrently')
+    expect(text).not.toMatch(/worktree DSH_SUPERAGENT_WORKTREE|host-created git worktree|names a worktree/)
+  }
+  await runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: '已完成。' })
+  const report = relays(runtime.masterId).filter(item => item.kind === 'worker_report').at(-1)!
+  expect(report.ticket).not.toHaveProperty('worktree')
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+  try { await runtime.pump(); await runtime.idle() } finally { vi.useRealTimers() }
+  expect(state(two.ticket.id)).toBe('running')
+  expect(runtime.store.tickets.get(two.ticket.id)!.execution!.directory).toBe(project)
+})
+
+it('freezes the concurrent-writes choice per ticket when the setting changes', async () => {
+  mkdirSync(join(directory, 'all-projects'))
+  const project = gitProject(join(directory, 'all-projects', 'service'))
+  await bindProject(project, true)
+  // An executor directory pointing into a project does not move worktrees there.
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, directory: join(directory, 'all-projects') } })
+  const isolated = await acceptedTicket(feishu('sw1', '@bot 修改一'))
+  expect(runtime.store.tickets.get(isolated.ticket.id)!.execution!.worktree!.path.startsWith(join(directory, 'local-worktrees') + '/')).toBe(true)
+  const worktree = runtime.store.tickets.get(isolated.ticket.id)!.execution!.worktree!
+  expect(existsSync(worktree.path)).toBe(true)
+  setConcurrentWrites(false)
+  const plain = await acceptedTicket(feishu('sw2', '@bot 修改二'))
+  const later = await acceptedTicket(feishu('sw3', '@bot 修改三'))
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  // The isolated ticket holds no project lock; the new ones are exclusive between themselves, without worktrees.
+  expect([state(isolated.ticket.id), state(plain.ticket.id), state(later.ticket.id)]).toEqual(['running', 'running', 'pending'])
+  expect(runtime.store.tickets.get(plain.ticket.id)!.execution).toMatchObject({ directory: project })
+  expect(runtime.store.tickets.get(plain.ticket.id)!.execution!.worktree).toBeUndefined()
+  expect(sections.get(isolated.sessionId)!.text({})).toContain('runs in its own git worktree DSH_SUPERAGENT_WORKTREE')
+  expect(sections.get(plain.sessionId)!.text({})).not.toContain('DSH_SUPERAGENT_WORKTREE')
+  // Turned off, the earlier ticket keeps and cleans up its own worktree, and a follow-up resumes it there.
+  writeFileSync(join(worktree.path, 'README.md'), 'changed\n')
+  await runTool(isolated.sessionId, 'orchestrator_report', { state: 'ready', summary: '已修改。' })
+  expect(relays(runtime.masterId).filter(item => item.kind === 'worker_report').at(-1)!.ticket).toMatchObject({ worktree: { path: worktree.path, branch: worktree.branch } })
+  await receive(feishu('sw4', '@bot 继续', { root_id: 'om_sw1' }))
+  expect(state(isolated.ticket.id)).toBe('running')
+  expect(runtime.store.tickets.get(isolated.ticket.id)!.execution).toMatchObject({ directory: worktree.path, worktree: { path: worktree.path } })
+  expect(readFileSync(join(worktree.path, 'README.md'), 'utf8')).toBe('changed\n')
+  execFileSync('git', ['checkout', '--', 'README.md'], { cwd: worktree.path })
+  await runTool(isolated.sessionId, 'orchestrator_report', { state: 'ready', summary: '撤销修改。' })
+  await vi.waitFor(() => { expect(runtime.store.tickets.get(isolated.ticket.id)!.execution!.worktree!.removedAt).toBeDefined() })
+  expect(existsSync(worktree.path)).toBe(false)
+  // Turned on again, a new ticket gets its worktree and runs beside the exclusive one.
+  setConcurrentWrites(true)
+  const again = await acceptedTicket(feishu('sw5', '@bot 修改四'))
+  expect(state(again.ticket.id)).toBe('running')
+  expect(runtime.store.tickets.get(again.ticket.id)!.execution!.worktree).toBeDefined()
+})
+
+it('keeps exclusive project access for write tickets on a project that is not a git repository', async () => {
+  mkdirSync(join(directory, 'all-projects'))
+  const project = join(directory, 'all-projects', 'plain'); mkdirSync(project)
+  await bindProject(project)
+  const one = await acceptedTicket(feishu('pl1', '@bot 修改一'))
+  const two = await acceptedTicket(feishu('pl2', '@bot 修改二'))
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  expect([state(one.ticket.id), state(two.ticket.id)]).toEqual(['running', 'pending'])
+  expect(one.ticket.execution).toMatchObject({ directory: realpathSync(project) })
+  expect(one.ticket.execution!.worktree).toBeUndefined()
+  expect(sections.get(one.sessionId)!.text({})).not.toContain('runs in its own git worktree DSH_SUPERAGENT_WORKTREE')
+})
+
+it('falls back to the exclusive project lock when the worktree cannot be created, never writing the project unlocked', async () => {
+  mkdirSync(join(directory, 'all-projects'))
+  const project = gitProject(join(directory, 'all-projects', 'service'))
+  await bindProject(project)
+  const reader = await acceptedTicket(feishu('fb1', '@bot 只读排查'), 'read-only')
+  // The worktree root is taken by a file, so no worktree can be created there.
+  writeFileSync(join(directory, 'local-worktrees'), 'x')
+  const execution = (ticket: string) => runtime.store.tickets.get(ticket)!.execution!
+  const trigger = feishu('fb2', '@bot 修改')
+  await receive(trigger)
+  const result = await route({ kind: 'accept', trigger_id: trigger.id, title: '修改', worktree_name: worktreeName, acknowledgement: '收到。' })
+  const writer = (result.ticket as { ticket_id: string }).ticket_id
+  const state = (id: string) => runtime.store.tickets.get(id)!.assignments.at(-1)!.state
+  expect(execution(writer)).toMatchObject({ directory: project, worktree: { error: expect.any(String) } })
+  expect(state(writer)).toBe('pending') // It waits for the reader instead of writing beside it.
+  await runTool(reader.sessionId, 'orchestrator_report', { state: 'ready', summary: '排查完成。' })
+  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+  try { await runtime.pump(); await runtime.idle() } finally { vi.useRealTimers() }
+  expect(state(writer)).toBe('running')
+  expect(controller.create).toHaveBeenCalledWith(expect.objectContaining({ sessionId: `worker-${writer}`, workspaceId: project }))
+  expect(Object.keys(Object.fromEntries(runtime.ticketEnvironment(runtime.store.tickets.get(writer)!).map(v => [v.key, v.value])))).not.toContain('DSH_SUPERAGENT_WORKTREE')
+})
+
+it('fails a read-only launch when the host cannot enforce its file policy', async () => {
+  delete services.sandboxPolicy
+  await (await restart()).ready
+  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  const one = await acceptedTicket(feishu('unconfined1', '@bot 只读排查'), 'read-only')
+  const ticket = runtime.store.tickets.get(one.ticket.id)!
+  expect(ticket.assignments.at(-1)?.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('sandboxPolicy') })
+  expect(deliveries.mock.calls.some(([call]) => call.sessionId === one.sessionId)).toBe(false)
+  expect(guards.get(one.sessionId)!({ name: 'bash', arguments: { command: 'touch unsafe' } })).toMatch(/cannot run unconfined/)
+})
+
+it('keeps replies to an accepted reply-message in its own ticket instead of evaluating them as new inferred work', async () => {
+  const first = await acceptedTicket(feishu('topic1', '@bot 看下转发的两个问题', { root_id: 'om_forwarded' }))
+  const sibling = await acceptedTicket(feishu('topic2', '@bot 另一个独立问题'))
+  subscribe(sibling.ticket.id, first.trigger.threads[0]!)
+  await runTool(first.sessionId, 'orchestrator_report', { state: 'ready', summary: '排查完成。' })
+  await runTool(sibling.sessionId, 'orchestrator_report', { state: 'ready', summary: '独立问题完成。' })
+  const follow = feishu('topic3', '1 把两个状态加下映射 2 reason 加长度限制', { mentions: [], root_id: 'om_topic1', parent_id: 'om_bot_answer', thread_id: 'omt_topic1' })
+  await receive(follow)
+  expect(runtime.store.triggers.disposition(follow.id)?.fanout).toEqual([first.ticket.id])
+  expect(runtime.store.tickets.get(first.ticket.id)!.ended).toBeUndefined()
+  expect(runtime.store.tickets.get(first.ticket.id)!.undelivered).toEqual([])
+  expect(runtime.store.tickets.get(sibling.ticket.id)!.ended?.outcome).toBe('completed')
+  expect(relays(runtime.masterId).some(item => item.kind === 'candidate' && item.trigger_id === follow.id)).toBe(false)
+  const deliveriesBefore = deliveries.mock.calls.filter(([call]) => call.sessionId === first.sessionId).length
+  expect(await receive(follow)).toBe('duplicate')
+  expect(deliveries.mock.calls.filter(([call]) => call.sessionId === first.sessionId)).toHaveLength(deliveriesBefore)
+})
+
+it('repairs a stored reply topic when a previously ignored message is explicitly requeued', async () => {
+  const first = await acceptedTicket(feishu('recover1', '@bot 查看转发的问题', { root_id: 'om_forwarded' }))
+  await runTool(first.sessionId, 'orchestrator_report', { state: 'ready', summary: '分析完成。' })
+  const oldSource = vi.spyOn(runtime.sources, 'replyRoot').mockReturnValue(undefined)
+  const follow = feishu('recover2', '现在按刚才的结果修复', { mentions: [], root_id: 'om_recover1' })
+  await receive(follow)
+  expect(runtime.store.triggers.disposition(follow.id)?.fanout).toEqual([])
+  await route({ kind: 'ignore', trigger_id: follow.id, reason: '未命中旧版规则' })
+  oldSource.mockRestore()
+  expect(runtime.engine.reevaluate(follow.id)).toBe(true)
+  await runtime.pump(); await runtime.idle()
+  const candidate = relays(runtime.masterId).filter(item => item.kind === 'candidate' && item.trigger_id === follow.id).at(-1)!
+  expect(candidate).toMatchObject({ strength: 'explicit', related_tickets: [expect.objectContaining({ ticket_id: first.ticket.id })] })
+  await route({ kind: 'attach', trigger_id: follow.id, ticket_id: first.ticket.id })
+  expect(runtime.store.tickets.get(first.ticket.id)!.ended).toBeUndefined()
+  expect(runtime.store.tickets.get(first.ticket.id)!.undelivered).toEqual([])
+})
+
+it('refuses a missing bound project instead of creating a worker in the default workspace', async () => {
+  const workspace = join(directory, 'all-projects'); mkdirSync(workspace)
+  await restart({ localWorkspace: workspace }, { github: { repository: '', cli: '' } })
+  await runtime.ready
+  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  const config = runtime.sources.instance('feishu')!.config
+  await runtime.settings.save('source:feishu', { enabled: true, config: { ...config, chats: [{ chatId: CHAT, listen: 'mentions', projectPath: join(directory, 'missing-project') }] } }, runtime.store.blockRevision('source:feishu'), 'panel')
+  const trigger = feishu('missing', '@bot 分析这个问题')
+  await receive(trigger)
+  const creates = controller.create.mock.calls.length
+  await expect(route({ kind: 'accept', trigger_id: trigger.id, title: '分析', worktree_name: 'analyze-project', acknowledgement: '收到，开始分析。' })).rejects.toThrow('Project workspace')
+  expect(controller.create).toHaveBeenCalledTimes(creates)
+  expect(runtime.store.tickets.list()).toHaveLength(0)
 })

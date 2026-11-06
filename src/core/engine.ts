@@ -142,7 +142,13 @@ export class Engine {
    * Queue a stored Trigger for a fresh Eval, such as a person's replay; returns false while an Eval holds it.
    * @throws UserError when the trigger is unknown.
    */
-  reevaluate(triggerId: string): boolean { return this.repo.atomic(() => this.evals.reevaluate(triggerId)) }
+  reevaluate(triggerId: string): boolean {
+    return this.repo.atomic(() => {
+      const trigger = this.repo.triggers.get(triggerId)
+      if (trigger && this.options.scope.scope(trigger).listened) this.tickets.correlateReply(trigger)
+      return this.evals.reevaluate(triggerId)
+    })
+  }
   /**
    * A person dismisses the problem an unavailable Decision shows: the overview lists it no more.
    * @throws UserError for a Decision that is unknown or not unavailable.

@@ -128,6 +128,7 @@ async function chatNamesLoop(ctx: SourceContext, signal: AbortSignal): Promise<v
 async function backfillLoop(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   await ctx.ready
   if (!available(ctx)) { ctx.report('history', health('paused', 'feishuBotMissing')); return }
+  let failures = 0
   while (!signal.aborted) {
     const config = enabled(ctx)
     if (!config) {
@@ -152,11 +153,16 @@ async function backfillLoop(ctx: SourceContext, signal: AbortSignal): Promise<vo
       } catch (error) { if (!signal.aborted) errors.push(`${chatId}: ${String(error)}`) }
     }
     await pollThreads(ctx, signal, tally)
+    for (const thread of ctx.threads.subscribed(SOURCE)) {
+      if (polled(ctx, thread) && thread.meta.pollError) errors.push(`${thread.key}: ${String(thread.meta.pollError)}`)
+    }
     const skipped = tally.skipped ? `; ${tally.skipped} unreadable messages skipped` : ''
     if (!signal.aborted) ctx.report('history', errors.length
       ? { state: 'error', detail: errors.join('\n') }
       : { state: 'ready', detail: `Configured groups and known direct chats recovered${skipped}`, at: new Date().toISOString() })
-    await delay(60_000, undefined, { signal }).catch(() => {})
+    // Keep live @mention intake running while failed history reads back off.
+    failures = errors.length ? Math.min(failures + 1, 4) : 0
+    await delay(Math.min(60_000 * 2 ** failures, 15 * 60_000), undefined, { signal }).catch(() => {})
   }
 }
 /**

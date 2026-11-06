@@ -2,6 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
+import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
@@ -134,7 +135,7 @@ export class Sessions {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
   }
-  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
+  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets the ticket's file policy, and renames it to `title`. */
   async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
@@ -149,7 +150,8 @@ export class Sessions {
     const settings = this.host.store.settings()
     await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
     await this.decorate(result.agent)
-    ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
+    if (this.ticketOf(result.agent)?.execution?.access === 'read-only') this.confineReadOnly(result.agent)
+    else ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
   }
@@ -245,7 +247,7 @@ export class Sessions {
       const version = this.promptFor(agent, context.signal !== undefined)
       const current = ticket && host.store.tickets.get(ticket.id)
       const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
-      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
+      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}${current?.execution?.access === 'read-only' ? '\nThis is a read-only investigation ticket. File writes and sandbox escalation are prohibited. Do not change code, run builds that write files, or mutate remote systems. Use orchestrator_read for available source context. Hand back later requests to modify files with orchestrator_trigger_handback so the router can create a separate write ticket; finish or hand off this read-only work so that ticket can obtain the project lock. Never upgrade this ticket or delegate writes.' : ''}`
     }, ...(master ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
     const skillScope = agent.ctx.inject(['skills'], scope => {
@@ -290,10 +292,33 @@ export class Sessions {
     const store = this.host.store
     const parent = scopeParentOf(agent)
     const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
+    if (store.tickets.get(ticketId)?.execution?.access === 'read-only') {
+      try { this.confineReadOnly(agent) } catch {
+        // Keep the denial guard installed even on an unsupported host. ensure refuses the parent launch;
+        // a descendant is denied at every tool boundary instead of inheriting unrestricted work tools.
+      }
+    }
+    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(execution => {
       const current = store.tickets.get(ticketId)
-      return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
+      if (!current || !liveTicket(current)) return 'Ticket ended; new work needs a new authorized ticket'
+      if (current.execution?.access !== 'read-only') return undefined
+      try { this.confineReadOnly(agent) } catch { return 'Read-only sandbox is unavailable; this ticket cannot run unconfined' }
+      if (execution && ['write', 'edit'].includes(execution.name)) return 'Read-only ticket cannot modify files; create a separate write ticket'
+      if (execution && ['bash', 'pwsh'].includes(execution.name)) {
+        const args = execution.arguments as { sandbox_permissions?: unknown } | undefined
+        if (args?.sandbox_permissions !== undefined && args.sandbox_permissions !== 'use_default') return 'Read-only ticket cannot escalate its sandbox'
+      }
+      return undefined
     })]
+  }
+  /** Pin the host's durable file policy before any worker/subagent call; missing enforcement fails closed. */
+  private confineReadOnly(agent: Agent): void {
+    const policy = this.ctx.get('sandboxPolicy') as { resolve(request: { session: Agent['session'] }): { mode: string } } | undefined
+    if (!policy || typeof policy.resolve !== 'function') throw new Error('Read-only execution requires the Harness sandboxPolicy service')
+    if (policy.resolve({ session: agent.session }).mode !== 'read-only') {
+      setSandboxMode(agent.session, 'read-only')
+    }
+    if (policy.resolve({ session: agent.session }).mode !== 'read-only') throw new Error('Harness did not apply the read-only sandbox')
   }
   /**
    * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's

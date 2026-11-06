@@ -29,6 +29,23 @@ const STATUS_REQUEST = 'Report the current ticket status with orchestrator_repor
 export class Tickets extends EnginePart {
   constructor(options: EngineOptions, private readonly replies: Replies) { super(options) }
 
+  /** A reply can open a new topic rooted at the accepted request, instead of its earlier quoted message. */
+  correlateReply(trigger: Trigger): void {
+    const parentId = this.options.scope.replyRoot?.(trigger)
+    const parent = parentId && this.repo.triggers.get(parentId)
+    const ref = trigger.threads[0]
+    if (!parent || !ref || parent.source !== trigger.source || !parent.channel || !trigger.channel
+      || parent.channel.thread !== trigger.channel.thread) return
+    if (parent.threads.some(thread => threadKey(thread) === threadKey(ref))) return
+    const candidates = new Set(parent.threads.flatMap(thread => this.repo.threads.get(threadKey(thread))?.subscriptions ?? []))
+    for (const id of candidates) {
+      const ticket = this.repo.tickets.get(id)
+      // A shared quoted thread may have several unrelated tickets; only the parent request's own ticket gains this topic.
+      if (!ticket || ticket.ended?.by === 'human' || !ticket.origin.triggerIds.includes(parent.id)) continue
+      this.subscribe(id, ref)
+    }
+  }
+
   /**
    * Create the ticket an accept decided, under `mandate`, with the Channels and Threads of the Eval's Triggers, its first
    * Assignment, and the acknowledgement the accept carries, and queue its launch. Its origin is the admissible Trigger that

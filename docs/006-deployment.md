@@ -202,7 +202,7 @@ The blocks:
 - `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
-- `executor`: `model`, `maxWorkers`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
+- `executor`: `model`, `maxWorkers`, `directory`, `prepare`, `blockedCommands` and `concurrentWrites` (local workspace mode only, default `false`). The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
 
 Changing a repository or CLI runs the corresponding setup check first. A failed check returns 400 with details in `setup`. A successful account change, or any save while setup is pending, returns `restarting: true`. The API is temporarily unavailable while the application restarts.
 
@@ -272,3 +272,38 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | The log says the plugin is incompatible with the running dsh | Install a DeepSeek Harness version within the `engines.dsh` range |
 | The panel shows "Failed to load plugins" after a DeepSeek Harness upgrade | Restart the running instance |
 | Nothing happens after a mention | Check that the author is on the Source's allowed list, the Source is on, and processing is not paused. On GitHub, a mention added by editing an Issue's body is not received; mention the agent in a comment |
+
+
+## Local workspace mode (local adaptation)
+
+This build adds an optional `localWorkspace` machine setting. Leave it empty for the upstream GitHub workflow. Set it to an existing absolute directory to work directly in a local, possibly multi-repository workspace:
+
+```yaml
+- id: dsh-superagent
+  config:
+    stateDir: /absolute/path/to/state
+    localWorkspace: /absolute/path/to/existing/workspace
+- id: dsh-superagent-github
+  disabled: true
+```
+
+In this mode no GitHub account or repository is required. Keep the Feishu Source and its bot-only CLI configured as above. Disable the GitHub Source as well; this is a local execution mode, not a GitLab event or merge-request integration.
+
+The workspace must already exist. The host does not create a clone or repository. Tickets ignore the prepare command. Read-only tickets use the existing directory directly and may run concurrently per project. By default (`executor.concurrentWrites` off) write tickets also use the project directory with exclusive project access and no worktree or branch is created. With **Execution → Concurrent writes per project** on at acceptance, a write ticket whose group-bound project is a git checkout with at least one commit gets its own `git worktree`, created serially per repository from the project's HEAD on branch `superagent/<ticket id>`, under `<stateDir>/local-worktrees` (independent of `executor.directory`), outside the project; such tickets run concurrently with each other and with readers, and reuse the worktree for follow-ups, resumes and restarts. The choice is frozen on the ticket: after the setting is turned off, tickets with a worktree keep using and cleaning it up, and new ones are exclusive. Other write tickets, and any whose worktree cannot be created, use the project directory with exclusive project access, including human follow-up wakes. Different bound projects can run concurrently up to `executor.maxWorkers`. Unbound write tickets and legacy tickets exclusively lock the shared workspace. An invalid or missing workspace fails setup. Existing branches, remotes and user changes remain in place. Read the workspace and nearest child repository instructions before changes. Analysis requests are read-only; local modifications require an explicit request. Commits, pushes, merge requests, publishing and deployment require explicit authorization.
+
+Only the operator's allowed Feishu account should be admitted initially. `observe` still permits explicit requests; it prevents inferred work from being executed automatically. Keep the DSH host running and online for event reception. Group use additionally requires the bot to join the selected group; private chat requires the same account allowlist.
+
+This is a local modification of the research prototype. Preserve the source patch when upgrading. Build with the pinned package manager, run `pnpm check`, then install a built tarball; installing the unbuilt upstream GitHub source loses this adaptation and may omit `lib/`.
+
+
+## Local group-to-project routing
+
+For installations using `localWorkspace`, configure **Sources → Feishu → Chats → Project directory** (`projectPath`) with an existing absolute project path for each group. Each configured project directory can be assigned to one listed group. New tickets store the canonical path and use it for both the worker Session workspace and `DSH_SUPERAGENT_LOCAL_WORKSPACE` / `DSH_SUPERAGENT_PROJECT`. This selects a project; it does not create a filesystem sandbox.
+
+Changing a binding does not move existing tickets or their Sessions. A missing, unreadable or replaced project directory prevents execution instead of creating a replacement or selecting another project. Chats without a binding and direct messages keep the installation's existing default workspace. On explicit acceptance the router sets `access` to `read-only` for investigation, explanation, review or a proposed plan requiring no file changes, otherwise `write`. Missing access means write, including legacy tickets. Access is frozen on the ticket and survives resume; modification follow-ups must be handed back to a separate write ticket. Read-only workers and their subagents are pinned to the host read-only file sandbox before execution, with file-write tools and shell sandbox escalation denied; a missing sandbox policy fails execution instead of running unconfined. This constrains local file effects, not remote database or network writes. CLI caches, build outputs and other file writes are also blocked.
+
+Project locks cover starting workers, active turns, and their background work. Read-only tickets share locks and worktree-isolated writers take none; any other writer excludes both readers and writers on overlapping roots. After a ticket ends, a clean worktree whose branch has no commit outside HEAD is removed with its branch; one with uncommitted changes or unmerged commits stays until a person merges or removes it (`git worktree remove`, `git branch -D`). Overlapping project roots share a lock. The global `executor.maxWorkers` limit still applies; a queued ticket waiting for its project does not prevent an independent project from starting. Unbound write tickets and legacy tickets, whose project was never frozen, run exclusively without changing their original directory.
+
+## Feishu replies rooted at an accepted reply
+
+A Feishu request may itself reply to a forwarded message. The bot then replies in a new topic rooted at that request. Incoming topic replies associate that topic with the ticket whose originating request is the retained root/parent message, within the same source chat. Other tickets sharing the earlier quoted thread are not added. The association is also repaired during duplicate history reads, without delivering the same input twice. Human-stopped tickets do not gain new topic subscriptions. Existing ticket follow-ups use their own admission and access; unrelated unmentioned messages remain inferred candidates constrained by the enabled rules.

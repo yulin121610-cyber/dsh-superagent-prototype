@@ -312,7 +312,22 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Execution { name: string; directory: string; assignment: string }
+export interface Execution {
+  name: string; directory: string; assignment: string
+  /** Canonical project root bound by the originating group at acceptance; later settings changes do not move this ticket. */
+  projectPath?: string
+  /** Frozen execution access; missing on legacy tickets means exclusive write access. */
+  access?: 'read-only' | 'write'
+  /**
+   * Local write tickets on a git project: the host-managed worktree the ticket runs in, outside the project, on its own branch,
+   * with `directory` inside it. It runs without the project lock. `error` records why it could not be created, and then
+   * `directory` is the project and the ticket holds the project lock as before. `removedAt` is set once a clean worktree with no
+   * unmerged commit was removed after the ticket ended; resuming the ticket creates it again.
+   */
+  worktree?: { path: string; branch: string; repository: string; base?: string; error?: string; removedAt?: string }
+}
+/** Whether a ticket runs isolated in its own host-managed worktree, and so holds no project lock. */
+export const isolatedExecution = (execution: Execution | undefined): boolean => !!execution?.worktree && !execution.worktree.error
 
 /** Whether a ticket is open: it has not ended. */
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended

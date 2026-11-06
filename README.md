@@ -8,6 +8,14 @@ dsh-superagent is a proactive coding agent for one GitHub repository, packaged a
 
 It is also a way of working with an agent: **take as little human attention as possible, and give as much value as possible.** An agent that can act for a whole team can also waste a whole team's attention, so it acts only when asked or when a rule the team wrote allows it, and speaks only when someone must act or can use a result. [docs/000-philosophy.md](docs/000-philosophy.md) explains the principle and what it asks of the operator.
 
+## Local workspace adaptation
+
+This local build (`0.1.0-local.10`) also supports Feishu requests against an existing local workspace without GitHub. Configure an absolute `localWorkspace` on the main plugin and disable the GitHub Source. Read-only tasks sharing that directory can run concurrently; by default writes require exclusive access and no clone, worktree, or branch is created. With **Execution → Concurrent writes per project** (`executor.concurrentWrites`, off by default) turned on, write tasks on a group-bound git project each get a host-created `git worktree` on branch `superagent/<ticket id>` outside the project and run concurrently; other writes stay exclusive. No clone is created. GitLab remotes are preserved. This does not implement GitLab event ingestion or merge requests. See the local workspace section in `docs/006-deployment.md` in the source checkout.
+
+## Group project bindings
+
+In local workspace mode, each Feishu chat row can set an optional absolute `projectPath`. New tickets from that group run in the existing project directory, and their worker environment and instructions use the same project. The canonical project path is saved on the ticket; changing a group's binding affects future tickets. Existing tickets, including resumed ones, keep their execution directory. Missing or unreadable bound directories fail explicitly instead of falling back to the default workspace. Blank bindings and direct messages retain the default workspace. Different bound projects can run concurrently up to `executor.maxWorkers`; read-only investigations may share a project, and write tickets hold exclusive access, including follow-up wakes, unless `executor.concurrentWrites` is on when the ticket is accepted. The choice is frozen per ticket: turning the setting off leaves tickets that already have a worktree in it, including their cleanup, while new tickets use the exclusive flow. With the setting on, a write ticket whose bound project is a git checkout with a commit runs in its own worktree under `<stateDir>/local-worktrees/<repository>-<hash>/<name>` (not the executor directory setting) on branch `superagent/<ticket id>`, created from the project's HEAD, so write tickets on one project run concurrently with each other and with readers. Its follow-ups, resumes and restarts reuse that worktree. When the project is not a git repository, or the worktree cannot be created, the ticket runs in the project directory with exclusive access, including follow-up wakes. Once a ticket ends, its worktree and branch are removed only if they hold no uncommitted change and no commit outside the project's HEAD; otherwise they stay for a person to review and merge, and the ticket card and reports name the path and branch. Acceptance records `access=read-only` explicitly; omitted access and legacy tickets remain exclusive. The host file sandbox enforces read-only workers and their subagents, and write/escalation tool calls are denied. Unbound write tickets and legacy tickets retain exclusive use of the shared workspace.
+
 ## Setup
 
 Setup has many steps, so an agent does it with you. Ask your coding agent:
@@ -37,3 +45,7 @@ Read the numbered documents in order; each builds only on the ones before it.
 ## License
 
 [MIT](LICENSE)
+
+## Feishu topic follow-ups
+
+When a request replies to a forwarded or quoted message and its bot conversation becomes a new topic, later topic replies follow the ticket of that exact request. Replies need no new mention; access and source admission remain enforced. New unmentioned requests outside existing ticket topics still use the configured inferred-work rules; auto mode does not accept every message.
