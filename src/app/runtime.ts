@@ -28,6 +28,7 @@ import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
+import { Jira } from './jira.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
@@ -61,6 +62,7 @@ export class Runtime extends Service implements SourceHost {
   readonly setup: Setup
   readonly prompts: Prompts
   readonly effects: Effects
+  readonly jira: Jira
   readonly sources: SourceRegistry
   readonly commands: Commands
   readonly sessions: Sessions
@@ -114,6 +116,9 @@ export class Runtime extends Service implements SourceHost {
       })
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
+      this.jira = new Jira({ store, effects, lifetime: this.lifetime,
+        panelUrl: () => `http://127.0.0.1:${ctx.webServer.port}/`,
+        sourceLink: async trigger => (await link(trigger, this.lifetime)).source_url ?? '', paused: () => this.paused() })
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
       const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
@@ -219,7 +224,7 @@ export class Runtime extends Service implements SourceHost {
   private httpHost(): HttpHost {
     const runtime = this
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
-    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
+    return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, jira: this.jira,
       get deployment() { return setup.deployment },
       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
       configured: () => setup.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),

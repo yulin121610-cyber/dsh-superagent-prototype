@@ -1596,6 +1596,29 @@ it('refuses an ended ticket\'s worker its tools, and restricts the main Session 
   expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
 })
 
+it('keeps scoped Team tools out of the router and permits Team work only while its Ticket is live', async () => {
+  const names = ['spawn_teammate', 'send_message', 'list_agents', 'interrupt_agent', 'wait_agent',
+    'team_task_create', 'team_task_list', 'team_task_get', 'team_task_update']
+  const { ticket, sessionId } = await acceptedTicket()
+  for (const name of names) {
+    expect(guards.get(runtime.masterId)!({ name, arguments: {} })).toMatch(/^The router cannot use Agent Teams/)
+    expect(guards.get(sessionId)!({ name, arguments: {} })).toBeUndefined()
+  }
+  runtime.engine.stopTicket(ticket.id)
+  for (const name of names) expect(guards.get(sessionId)!({ name, arguments: {} })).toMatch(/^Ticket ended/)
+})
+
+it('uses rostered teammates when Team is loaded, retaining ordinary delegation without Team', async () => {
+  const { sessionId } = await acceptedTicket()
+  const call = (name: string) => ({ name, arguments: {} })
+  expect(guards.get(sessionId)!(call('subagent'))).toBeUndefined()
+  const ctx = (runtime as unknown as { ctx: Context }).ctx
+  ctx.reflect.provide('agentTeams', { tryMembership: (agent: { id: string }) => agent.id === sessionId ? { role: 'lead' } : undefined })
+  for (const name of ['subagent', 'subagent_fork']) expect(guards.get(sessionId)!(call(name))).toMatch(/use spawn_teammate/)
+  expect(guards.get(sessionId)!(call('spawn_teammate'))).toBeUndefined()
+  expect(guards.get(sessionId)!(call('read'))).toBeUndefined()
+})
+
 it('gives an explicit ticket\'s worker a prompt without the limits of an inferred Mandate', async () => {
   const { sessionId } = await acceptedTicket()
   await runtime.idle()

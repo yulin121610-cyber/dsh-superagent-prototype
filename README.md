@@ -10,7 +10,7 @@ It is also a way of working with an agent: **take as little human attention as p
 
 ## Local workspace adaptation
 
-This local build (`0.1.0-local.11`) also supports Feishu requests against an existing local workspace without GitHub. Configure an absolute `localWorkspace` on the main plugin and disable the GitHub Source. Read-only tasks sharing that directory can run concurrently; by default writes require exclusive access and no clone, worktree, or branch is created. With **Execution → Concurrent writes per project** (`executor.concurrentWrites`, off by default) turned on, write tasks on a group-bound git project each get a host-created `git worktree` on branch `superagent/<ticket id>` outside the project and run concurrently; other writes stay exclusive. A group can list services under its project, and a ticket then locks only the services it touches. No clone is created. GitLab remotes are preserved. This does not implement GitLab event ingestion or merge requests. See the local workspace section in `docs/006-deployment.md` in the source checkout.
+This local build (`0.1.0-local.12`) also supports Feishu requests against an existing local workspace without GitHub. Configure an absolute `localWorkspace` on the main plugin and disable the GitHub Source. Read-only tasks sharing that directory can run concurrently; by default writes require exclusive access and no clone, worktree, or branch is created. With **Execution → Concurrent writes per project** (`executor.concurrentWrites`, off by default) turned on, write tasks on a group-bound git project each get a host-created `git worktree` on branch `superagent/<ticket id>` outside the project and run concurrently; other writes stay exclusive. A group can list services under its project, and a ticket then locks only the services it touches. No clone is created. GitLab remotes are preserved. This does not implement GitLab event ingestion or merge requests. See the local workspace section in `docs/006-deployment.md` in the source checkout.
 
 ## Group project bindings
 
@@ -18,7 +18,22 @@ In local workspace mode, each Feishu chat row can set an optional absolute `proj
 
 The same chat row can list `services` under that project: a name and a path relative to the project. The saved list is the source of truth; **Discover services** only suggests candidates (child git repositories, or the top-level directories of a monorepo). At accept, `orchestrator_route` sets `services` to the names the request touches, or omits them for the whole project. That choice is frozen on the ticket like `access`. Write tickets on different services run in parallel. A ticket that names several services holds all of them. A whole-project ticket conflicts with any service ticket that uses the shared checkout. Services that are subfolders of one git checkout stay exclusive with each other unless `concurrentWrites` gives each ticket its own worktree of that repository, because they would otherwise share one git index and branch. A multi-repo ticket with `concurrentWrites` on gets a worktree per touched repository, shown together under `<stateDir>/local-worktrees/services-<hash>/<name>/`. A service that is not a git repository, has no commit, or whose worktree cannot be created keeps exclusive access to that service. Groups with no service list behave as before: the lock is the project path.
 
+## Optional Jira Server / Data Center integration
+
+Version `0.1.0-local.12` can sync new tickets from mapped Feishu groups to self-hosted Jira, and browse Jira issues in the panel. It is **off by default** and leaves the GitHub workflow unchanged. In **Settings → Jira**, set the base URL, a PAT file/environment reference, group-to-project mappings and transition names or IDs. The token never enters the panel or settings database. The **Jira** tab supports project selection, filters, text/JQL search, pagination and a status board. “Me” is the integration account.
+
+1. Create a PAT in your Jira account (**Profile → Personal Access Tokens**, Jira DC 8.14+).
+2. Save it on the DSH host at `~/.config/dsh-superagent-jira/token`, readable by the DSH process, with mode `0600`. Alternatively choose an environment variable reference. Never paste the token into configuration.
+3. Configure each existing Feishu group’s Jira project key and issue type (default `Task`), then enable Jira.
+4. Run **Test connection** and configure transitions for your workflow, using a representative issue to inspect its available transitions.
+
+See the Jira section in [006 Deployment](docs/006-deployment.md) for the full configuration example, Basic fallback and recovery. Sync uses the durable effects queue; Jira failures never fail tickets. Existing tickets are enrolled only with **Sync this ticket to Jira**. Unknown create outcomes are reconciled before another create is allowed, preventing automatic duplicates after lost responses or restarts.
+
 ## Setup
+
+### Optional Agent Teams (local.13)
+
+With the desktop runtime's matching `@deepseek-ai/dsh-experimental-agent-team-profile` bundle enabled after `dsh-base`, Ticket Executors can use `spawn_teammate`, peer messages, and the shared task board. The bundle includes the Team service, tools, and browser UI; do not mix its package versions with another runtime release. Ordinary delegation remains available when Team is disabled. When Team is enabled, Executors use rostered teammates instead of ordinary subagents, since Team message targets refer only to its roster. Team tools are scoped registrations and bypass inherited-tool masks, so the router explicitly denies them. Executors and their teammates retain the existing Ticket-end guards and read-only sandbox. Teams share the Ticket's working directory; the Lead must coordinate disjoint write scopes and wait for required results before reporting readiness.
 
 Setup has many steps, so an agent does it with you. Ask your coding agent:
 

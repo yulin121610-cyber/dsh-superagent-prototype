@@ -169,7 +169,7 @@ Agents may rely on these routes and fields. The other routes in `src/app/api.ts`
 | Request | Answer |
 | --- | --- |
 | `GET state` | What every page reads: `setup`, with `problem` and `feishuProblem`, each `null` or a setup problem with `place`, `code`, `values` and `detail`, and `accounts` once setup resolved them; `health`, an entry per part, below, with `state` (`starting`, `ready`, `paused` or `error`), `detail` and `at`; `load`, the Executor Sessions `running`, the Tickets `queued` and `maxWorkers`; `paused`; and `masterId` |
-| `GET settings` | `blocks`: `policy`, `eval` and `executor`, each with its `value` and its `revision`; `sources`: the Source instances, each with `id`, `kind`, `installed`, its block's `value`, `{"enabled": …, "config": {…}}`, and `revision`, its kind's form, and its setup `problem` when it has one; `policyVersion`; and `environment`, the execution environment's `root` and `variables` |
+| `GET settings` | `blocks`: `policy`, `eval`, `executor` and `jira`, each with its `value` and its `revision`; `sources`: the Source instances, each with `id`, `kind`, `installed`, its block's `value`, `{"enabled": …, "config": {…}}`, and `revision`, its kind's form, and its setup `problem` when it has one; `policyVersion`; and `environment`, the execution environment's `root` and `variables` |
 | `GET sources` | Each Source's status: `state` (`missing`, `off`, `error`, `setup`, `starting`, `paused` or `ready`), the `health` of its parts, its setup `problem`, the last day's `stats`, the Triggers it `filtered` in that day, and the messages it `dropped` in that day, newest drop first, each with its `channel`, `preview`, `ticket` (`id` and `title`) when it was for one, its `thread` when the store has it, and `dropped.at` and `dropped.reason`, `channelGone` or `channelIgnored` |
 | `PUT settings/<block>` with `{"value": …, "revision": n}` | Saves one block: `saved`, the block's new `revision`, `policy_changed` and `restarting`. `value` is the whole block, as `GET settings` holds it; a missing key takes its default |
 | `POST executor/pause` with `{"paused": true}` or `false` | Pauses or resumes processing: `paused` |
@@ -185,7 +185,7 @@ Health entries are grouped by responsibility:
 | `runtime` | The application itself |
 | `models` | Sessions waiting on a model-budget retry |
 | `evals` | Unavailable Evals from the last hour with no later judgement or dismissal |
-| `assessment`, `launch`, `delivery`, `relay`, `notice`, `reply` | Stored work described in [003 Execution](003-execution.md); delivery counts waiting work, while reply covers Channel messages |
+| `assessment`, `launch`, `delivery`, `relay`, `notice`, `reply`, `jira` | Stored work described in [003 Execution](003-execution.md); delivery counts waiting work, while reply covers Channel messages |
 | `worker` | Executor Session event handling; appears after its first failure |
 | `github`, `feishu`, `history` | Source polling, events and history recovery |
 | `sync:<source id>` | Allowed-list synchronization |
@@ -360,3 +360,103 @@ Existing tickets have no `services` field and keep their project lock. GitHub mo
 ## Feishu replies rooted at an accepted reply
 
 A Feishu request may itself reply to a forwarded message. The bot then replies in a new topic rooted at that request. Incoming topic replies associate that topic with the ticket whose originating request is the retained root/parent message, within the same source chat. Other tickets sharing the earlier quoted thread are not added. The association is also repaired during duplicate history reads, without delivering the same input twice. Human-stopped tickets do not gain new topic subscriptions. Existing ticket follow-ups use their own admission and access; unrelated unmentioned messages remain inferred candidates constrained by the enabled rules.
+
+## Jira Server / Data Center (optional, local.12)
+
+Jira is a one-way integration from Superagent to your self-hosted Jira Server / Data Center, using REST API v2. It is disabled by default. GitHub tickets, direct messages and unmapped groups do not enroll automatically. No old ticket is scanned or backfilled at startup, configuration save, resume or report. A group must exist under `sources.feishu.config.chats` and have a Jira mapping.
+
+### 1. Create the integration credential
+
+Use a dedicated Jira account with Browse Projects, Create Issues, Add Comments and Transition Issues permissions on each mapped project, plus assignment/component permissions when those optional fields are configured. For Jira Data Center 8.14+ open the account’s **Profile → Personal Access Tokens**, create a token and choose its expiry according to your team’s policy. The integration sends it as `Authorization: Bearer …`.
+
+If PAT authentication is unavailable on your Server/DC version, select **Basic** explicitly and enter the Jira username. The referenced secret then contains that account’s password. There is no automatic downgrade from Bearer to Basic and no Jira Cloud API-token assumption.
+
+### 2. Put the secret on the DSH host
+
+Create the directory as the OS account running DSH, and write the token using an editor or your secret manager:
+
+```sh
+mkdir -p ~/.config/dsh-superagent-jira
+chmod 700 ~/.config/dsh-superagent-jira
+# Write the token into ~/.config/dsh-superagent-jira/token without putting it in a shell command/history.
+chmod 600 ~/.config/dsh-superagent-jira/token
+```
+
+The default reference is `{"kind":"file","path":"~/.config/dsh-superagent-jira/token"}`. `~` resolves to the DSH process user’s home. Absolute paths are also accepted. A non-regular file, an unreadable file, a file over 16 KiB, an empty value or a multiline credential fails safely. Permissions broader than `0600` produce a warning in the connection test and Jira page after the next credential read. The plugin never changes that file.
+
+Alternatively set the credential in the DSH process environment and configure `{"kind":"env","name":"DSH_SUPERAGENT_JIRA_TOKEN"}`. The process must actually inherit that variable: setting it in a separate terminal after DSH started has no effect. Token rotation in a file is picked up on the next operation.
+
+Only the reference is saved. The secret is never a settings field, settings-history value, SQLite record, worker prompt, panel response or browser request. Remote error bodies and authorization headers are not logged or returned. Redirects are refused to keep the credential on the configured server.
+
+### 3. Map groups to Jira projects
+
+Open **Settings → Jira**. Enter your base URL including any context path, such as `https://jira.example.org/jira`, with no credentials, query or fragment. Add a row for each configured Feishu group: project key, issue type (`Task` by default), optional comma-separated labels/components, and an optional assignee **Jira username**. Choose exactly one Jira project per group; several groups may share a project. Groups without rows do not sync.
+
+Example complete `jira` settings block (references and placeholders only):
+
+```json
+{
+  "enabled": true,
+  "baseUrl": "https://jira.example.org/jira",
+  "auth": "bearer",
+  "username": "",
+  "secret": { "kind": "file", "path": "~/.config/dsh-superagent-jira/token" },
+  "panelUrl": "http://127.0.0.1:3082/",
+  "mappings": [
+    {
+      "chatId": "oc_team",
+      "projectKey": "TEAM",
+      "issueType": "Task",
+      "labels": ["superagent"],
+      "components": ["API"],
+      "assignee": "jira-bot"
+    }
+  ],
+  "transitions": {
+    "working": "Start Progress",
+    "blocked": "Block",
+    "failed": "Block",
+    "ready": "In Review",
+    "completed": "31",
+    "merged": "31",
+    "stopped": "Stop Progress"
+  }
+}
+```
+
+Replace every example workflow transition with one your Jira workflow actually exposes. `panelUrl` is optional and defaults to the DSH loopback web URL; set a reachable panel URL for your team if needed. Its `superagentTicket` query opens the ticket when the Superagent panel mounts. The description also includes the original Feishu request and its source link, group, frozen services and read-only/write access. Source-link lookup failures do not prevent issue creation; the retained request is always included.
+
+Save through the panel, or `PUT settings/jira` using the block’s revision from `GET settings`, with `{"value": <block above>, "revision": <current revision>}`. Settings validation refuses inline `token`, `password` or unknown fields before persisting anything. Turning Jira on does not require a DSH restart.
+
+### 4. Test authentication and configure transitions
+
+Save the configuration, choose a mapped project and click **Test connection**. Optionally enter a representative issue key from that project. The test calls `/myself`, reads the project’s issue types, and lists the sample issue’s currently available transition names, IDs and destination statuses. If no sample is supplied, it uses the most recently updated readable issue. An empty project has no sample transitions: create an ordinary test issue in Jira first. The connection test does not create or mutate issues.
+
+Jira transitions are specific to an issue’s current workflow state; REST v2 does not expose a universal project-wide transition list. Inspect representative issues in the other workflow states as well. Map Superagent states `accepted`, `working`, `waiting`, `blocked`, `failed`, `ready`, `completed`, `merged`, `closed`, `dropped` and `stopped` to the transition **name or ID**, not the destination status ID. Blank means no transition. Configure transitions that require no additional interactive field input. An unavailable transition remains queued with an actionable error rather than silently dropping the state change. `ready` means a report is ready while the ticket awaits review/PR; `completed` is a ticket completed without waiting for a PR. Mapping changes affect pending operations and future changes.
+
+### 5. Operate and recover
+
+At acceptance, mapped new tickets enroll atomically with their Jira journal and `jira` effect. Each issue has a stable `dsh-sa-…` label. Keep this label intact: it recovers a create whose response was lost. Jira is processed with concurrency **2**, independent of workers and other effects, and uses the existing retry backoff (5 seconds doubling to 5 minutes) and pause/Later behavior. Operations remain ordered per ticket, even when a report arrives while a request is in flight. Disabling Jira or pausing processing holds synchronization; re-enabling resumes its durable queue. The issue mapping and base URL are frozen for enrolled tickets; changing the base URL pauses their sync with an error until it is restored, preventing an old issue key being sent to a different server.
+
+Failure/ready-result/completion comments contain the report summary, recorded branches/worktrees, execution directory and PR links from the report or followed threads. Comments carry a stable operation marker and recovery reads every comment page. Current status is checked before replaying a transition with a lost response. Jira keys link from ticket cards/detail pages and Feishu replies sent after the key is known. Host-added links sit outside the authored reply’s 100-word budget. GitHub replies are unchanged.
+
+A failed sync appears on its ticket immediately and in `health.jira` after three consecutive effect failures. It never ends, blocks or fails the Superagent ticket. A successful retry clears the ticket error and health. The **Jira** tab queries only through the backend: select all mapped projects or one, use assigned/reported/open/done filters, text or raw JQL, page the list, refresh the 15-second bounded cache, or group the current page by status. “Assigned to me” and “reported by me” refer to the Jira account behind the configured credential. Issue links open Jira in a new tab; linked records also offer **Open Ticket**. Jira reads do not create Superagent tickets.
+
+Older tickets require **Sync this ticket to Jira** on their detail page. This explicitly enrolls that one ticket with its current state/result. Use the same action to wake a pending retry after fixing configuration or connectivity. It never scans other tickets.
+
+Jira REST v2 provides no general atomic create idempotency key. Before creating, the plugin searches the stable label and durably records a send intent. If the response is lost, a restart happens between intent and acknowledgement, or a server error leaves the write outcome unknown, it **only searches for recovery** and does not blindly create again, even while Jira indexing is delayed. The same conservative rule applies to comments with an unknown outcome. A definite 4xx rejection can retry automatically.
+
+If recovery cannot find the record, inspect Jira first. On the ticket, enter an existing issue key and click **Sync this ticket to Jira** to restore its association. If you have positively confirmed that the issue or pending comment was never created, use **Confirm absence and resend**. This explicit confirmation permits another write; an incorrect confirmation can create a duplicate. Do not remove marker labels or retry an unknown create blindly. No automatic retry can guarantee both progress and absence of duplicates after a lost response without Jira-side idempotency support.
+
+Additional local API routes:
+
+| Request | Meaning |
+| --- | --- |
+| `GET jira` | Enabled flag, mapped project keys and latest credential-file warning; no secret |
+| `POST jira/test` with `{"project":"TEAM","issue":"TEAM-1"}` | Authenticated display name, issue types and the sample issue’s current transitions; `issue` optional |
+| `GET jira/search?project=TEAM&filter=open&startAt=0&maxResults=25` | Project-scoped issue list, `total`, `startAt`, `next`; project optional; filters `all`, `assigned`, `reported`, `open`, `done`; optional `text`, `jql`, `refresh=1`; maximum 100 per page |
+| `POST tickets/<id>/jira` with `{}` | Explicitly enroll or retry one ticket |
+| Same route with `{"issueKey":"TEAM-1"}` | Associate a confirmed existing issue in the enrolled project |
+| Same route with `{"retryUncertain":true}` | Human-confirmed absence permits resending an uncertain create/comment |
+
+All use the existing loopback/same-origin protections. Secrets are loaded only server-side, and the backend never serves arbitrary target URLs.

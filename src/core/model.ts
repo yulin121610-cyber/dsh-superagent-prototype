@@ -276,6 +276,8 @@ export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'sto
 export interface Attention { id: string; question: string; triggerId?: string }
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
+  /** Jira adapter-owned sync metadata; no credentials. Absent on tickets never explicitly enrolled in Jira. */
+  jira?: { key?: string; url?: string; error?: string; pending?: boolean }
   id: string
   title: string
   decisionId: string

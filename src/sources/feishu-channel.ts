@@ -19,7 +19,7 @@ const gone = (error: unknown): boolean => error instanceof CliError && error.cod
 export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const messageId = message.channel.address.messageId
   if (!messageId) throw new Error('Missing Feishu reply target')
-  const text = checkedImText(message.text)
+  const text = [checkedImText(message.text), ...message.links?.map(link => `[${link.label}](${link.url})`) ?? []].join('\n\n')
   const reply = ['im', '+messages-reply', '--message-id', messageId, '--markdown', text, '--reply-in-thread', '--idempotency-key', message.id]
   try { await host.commands.lark(reply) }
   catch (error) {

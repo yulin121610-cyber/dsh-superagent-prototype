@@ -9,7 +9,7 @@ type SourceSettings = SettingsVersion['settings']['sources'][string]
 export type SettingsChangeCode = 'ruleAdded' | 'ruleRenamed' | 'ruleInstruction' | 'ruleEnabled' | 'ruleDisabled' | 'ruleRemoved'
   | 'sourceEnabled' | 'sourceDisabled' | 'sourceField' | 'sourceRowsAdded' | 'sourceRowsRemoved' | 'sourceRowsChanged' | 'sourceAdmission'
   | 'mode' | 'timeout' | 'evalModel' | 'executorModel' | 'maxWorkers' | 'paused' | 'resumed' | 'executionDirectory' | 'prepareCommand'
-  | 'blockedCommands' | 'concurrentWrites'
+  | 'blockedCommands' | 'concurrentWrites' | 'jira'
 /** A single settings diff entry rendered by the panel using `change.<code>` and field labels from the Source listing. */
 export interface SettingsChange {
   code: SettingsChangeCode; items?: string[]; from?: string | number | boolean; to?: string | number | boolean; name?: string; source?: string
@@ -46,6 +46,7 @@ function sourceChanges(id: string, before: SourceSettings | undefined, after: So
 }
 function settingsChanges(before: SettingsVersion['settings'], after: SettingsVersion['settings'], sources: SourceRegistry): SettingsChange[] {
   const changes: SettingsChange[] = []
+  if (!same(before.jira, after.jira)) changes.push({ code: 'jira' })
   for (const rule of after.policy.rules) {
     const old = before.policy.rules.find(item => item.id === rule.id)
     if (!old) { changes.push({ code: 'ruleAdded', name: rule.name }); continue }

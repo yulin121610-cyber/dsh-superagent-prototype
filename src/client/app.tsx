@@ -16,6 +16,7 @@ import { SourceStatus } from './source.tsx'
 import { actorName, errorText, reasonLabel, valueLabel, type T, readableMarkers } from './text.ts'
 import { ThreadPage } from './thread.tsx'
 import { TicketPage } from './ticket.tsx'
+import { JiraPage } from './jira.tsx'
 import { TriggerStatus } from './trigger.tsx'
 import { When } from './widgets.tsx'
 
@@ -148,6 +149,7 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
     switch (route.page) {
       case 'overview': return <OverviewPage />
       case 'source': return <SourceStatus />
+      case 'jira': return <JiraPage />
       case 'trigger': return route.id !== undefined ? <ThreadPage key={route.id} id={route.id} target={route.query?.trigger} />
         : <TriggerStatus filter={route.query?.filter ?? 'subscribed'} />
       case 'eval': return <EvalStatus filter={route.query?.filter ?? 'work'} window={route.query?.window}

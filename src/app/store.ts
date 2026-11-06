@@ -49,6 +49,12 @@ export { SCHEMA_VERSION }
  * The Engine mutates domain aggregates inside `atomic` transactions while Sources, views, and the Outbox read state or update their own records.
  */
 export class Store implements Repositories {
+  /** Adapter hook runs synchronously inside the ticket transaction, persisting only durable effects and journals. */
+  ticketSaved?: (ticket: Ticket, previous?: Ticket) => void
+  /** Jira is the sole writer of this metadata; domain/executor saves preserve it. */
+  setTicketJira(id: string, value: NonNullable<Ticket['jira']>): void {
+    this.db.prepare("UPDATE ticket SET value = json_set(value, '$.jira', json(?)) WHERE id = ?").run(JSON.stringify(value), id)
+  }
   readonly db: DatabaseSync
   /**
    * Opens or creates the SQLite database at `path`, migrating schema 10 to schema 11 in a single transaction.
@@ -232,7 +238,15 @@ export class Store implements Repositories {
   }
   readonly tickets = {
     get: (id: string): Ticket | undefined => { const row = this.db.prepare('SELECT value FROM ticket WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Ticket : undefined },
-    save: (ticket: Ticket): void => { this.db.prepare('INSERT INTO ticket VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(ticket.id, JSON.stringify(ticket)) },
+    save: (ticket: Ticket): void => {
+      this.atomic(() => {
+        const previous = this.ticketSaved ? this.tickets.get(ticket.id) : undefined
+        // Adapter metadata may have advanced since an executor read this aggregate before awaiting I/O.
+        if (previous?.jira) ticket = { ...ticket, jira: previous.jira }
+        this.db.prepare('INSERT INTO ticket VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(ticket.id, JSON.stringify(ticket))
+        this.ticketSaved?.(ticket, previous)
+      })
+    },
     /** Newest first. */
     list: (): Ticket[] => this.values('SELECT value FROM ticket ORDER BY rowid DESC'),
     /** Newest first. */

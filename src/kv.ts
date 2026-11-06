@@ -6,6 +6,7 @@ import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
+import type { JiraJournal } from './app/jira.ts'
 
 /** Key of a KV record whose value has type `V`; a plain string represents an untyped key. */
 export type Key<V> = string & { readonly __value?: V }
@@ -19,6 +20,8 @@ export function family<V, A extends unknown[] = [string]>(prefix: string, format
 }
 
 export const KV = {
+  /** Jira: enrolled ticket's durable create intent and ordered state/comment operations. */
+  jira: { ticket: family<JiraJournal, [ticket: string]>('jira-ticket:') },
   /** Store: current database schema version. */
   store: { schema: record<number>('schema') },
   /** Settings: current revision, per-block revision, and saved settings snapshots (including the current one). */
